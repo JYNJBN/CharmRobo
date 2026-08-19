@@ -1,0 +1,22 @@
+[project]
+name = "cml-websit-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiomysql>=0.3.2",
+    "alembic>=1.19.1",
+    "cryptography>=50.0.0",
+    "fastapi[standard]>=0.141.1",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.13.0",
+    "pymysql>=1.2.0",
+    "redis>=8.1.0",
+    "sqlalchemy>=2.0.51",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+]
