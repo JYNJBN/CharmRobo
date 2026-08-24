@@ -181,6 +181,11 @@ async def phone_login_service(
         select(User).where(User.openid == openid, User.deleted == 0)
     )
     user = result.scalar_one_or_none()
+    # 如果查询到用户存在并且手机号不一致的时候更新手机号
+    if user is not None and user.phone != phone:
+        user.phone = phone
+        await db.commit()
+        await db.refresh(user)
 
     if user is None:
         # 手机号已注册过的老用户：补绑 openid，下次可继续用

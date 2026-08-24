@@ -1,6 +1,8 @@
 from datetime import datetime
-from sqlalchemy import BigInteger, DateTime, Integer, String, func, text, SmallInteger
+
+from sqlalchemy import BigInteger, DateTime, Integer, SmallInteger, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
+
 from app.core.database import Base
 
 """"设备表"""

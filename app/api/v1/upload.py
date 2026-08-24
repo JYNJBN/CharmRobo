@@ -1,5 +1,6 @@
 import uuid
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
@@ -21,7 +22,7 @@ MAX_SIZE = 10 * 1024 * 1024
 @router.post("/avatar", response_model=ApiResponse)
 async def upload_avatar(
     current_user_id: CurrentUserId,
-    file: UploadFile = File(..., description="头像图片文件"),
+    file: Annotated[UploadFile, File(description="头像图片文件")],
 ):
     """
     上传头像图片。

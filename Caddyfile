@@ -1,0 +1,7 @@
+api.szcharmrobo.com {
+    # 所有 HTTPS、WebSocket、static、docs 请求都转发给 FastAPI。
+    reverse_proxy backend:8000
+
+    # 输出访问日志，方便部署初期排查。
+    log
+}

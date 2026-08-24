@@ -5,6 +5,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
 from app.core.database import Base
+
 # 导入所有模型，确保 Base.metadata 包含完整的表结构
 from app.models import user  # noqa: F401
 

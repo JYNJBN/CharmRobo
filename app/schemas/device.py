@@ -28,6 +28,7 @@ class BootstrapDeviceRequest(BaseModel):
     device_sn: str = Field(
         min_length=4,
         max_length=64,
+        description="设备sn",
     )
     device_secret: str = Field(
         min_length=32,
@@ -37,18 +38,22 @@ class BootstrapDeviceRequest(BaseModel):
     bind_ticket: str = Field(
         min_length=20,
         max_length=255,
+        description="一次性绑定码",
     )
     product_key: str = Field(
         min_length=1,
         max_length=64,
+        description="产品型号或产品系列标识",
     )
     firmware_version: str | None = Field(
         default=None,
         max_length=32,
+        description="固件版本",
     )
     hardware_version: str | None = Field(
         default=None,
         max_length=32,
+        description="硬件版本",
     )
 
 

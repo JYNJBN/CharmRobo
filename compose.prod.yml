@@ -1,0 +1,116 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: charming-mysql
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD}
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: charming-redis
+    restart: unless-stopped
+
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+    command:
+      - sh
+      - -c
+      - exec redis-server --requirepass "$${REDIS_PASSWORD}"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$${REDIS_PASSWORD}" ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: .
+    container_name: charming-backend
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    # 容器内部不能使用 127.0.0.1 连接其他容器。
+    # mysql 和 redis 是上面的服务名称。
+    environment:
+      DEBUG: "false"
+      MYSQL_HOST: mysql
+      REDIS_HOST: redis
+      UPLOAD_DIR: /app/uploads
+
+      # 替换成你的真实 HTTPS 域名。
+      PUBLIC_BASE_URL: https://api.szcharmrobo.com
+
+    volumes:
+      - uploads_data:/app/uploads
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    expose:
+      - "8000"
+
+    # 每次容器启动，先执行未执行的数据库迁移，再启动 FastAPI。
+    command:
+      - sh
+      - -c
+      - >
+        alembic upgrade head &&
+        exec uvicorn app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --proxy-headers
+        --forwarded-allow-ips "*"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: charming-caddy
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
+  redis_data:
+  uploads_data:
+  caddy_data:
+  caddy_config:

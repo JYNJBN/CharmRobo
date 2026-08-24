@@ -14,7 +14,11 @@ from app.schemas.device import (
     UserDeviceResponse,
 )
 from app.services.device_binding_service import create_bind_ticket
-from app.services.device_service import bootstrap_device, get_devices_by_user_id
+from app.services.device_service import (
+    bootstrap_device,
+    get_devices_by_user_id,
+    unbind_device_for_user,
+)
 
 # 小程序调用的接口，需要用户 JWT。
 user_device_router = APIRouter(
@@ -114,3 +118,29 @@ async def get_my_devices_api(
     )
 
     return ApiResponse(data=devices)
+
+
+@user_device_router.delete(
+    "/{device_id}",
+    response_model=ApiResponse[None],
+)
+async def unbind_device_api(
+    device_id: int,
+    db: DbSession,
+    current_user_id: CurrentUserId,
+) -> ApiResponse[None]:
+    """解除当前用户和设备的绑定，不删除硬件设备记录。"""
+
+    try:
+        await unbind_device_for_user(
+            db=db,
+            user_id=current_user_id,
+            device_id=device_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    return ApiResponse(message="设备已移除", data=None)

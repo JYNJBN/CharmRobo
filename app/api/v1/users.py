@@ -21,7 +21,7 @@ def _resolve_ip_location(client_host: str | None) -> str:
         return ""
     if client_host == "127.0.0.1" or client_host.startswith("::1"):
         return "本地"
-    if client_host.startswith("192.168.") or client_host.startswith("10.") or client_host.startswith("172.16."):
+    if client_host.startswith(("192.168.", "10.", "172.16.")):
         return "局域网"
     # 公网 IP 暂时返回空，后续接入 IP 解析服务
     return ""

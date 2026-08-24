@@ -28,8 +28,18 @@ class Settings(BaseSettings):
     jwt_secret_key: SecretStr
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 10080
+    # 语音key 模型配置
+    ark_api_key: SecretStr
+    ark_model: str
+    volc_asr_api_key: SecretStr | None = None
+    volc_asr_resource_id: str = "volc.bigasr.auc_turbo"
+    volc_stream_asr_resource_id: str = "volc.seedasr.sauc.duration"
+    volc_tts_api_key: SecretStr | None = None
+    volc_tts_resource_id: str = "seed-tts-2.0"
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问
     upload_dir: str = "uploads"
+    # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。
+    public_base_url: str | None = None
     @property
     def alembic_database_url(self) -> str:
         return (

@@ -1,0 +1,12 @@
+.git
+.idea
+.venv
+__pycache__
+*.pyc
+.ruff_cache
+
+# 真实密钥不能打进镜像
+.env
+
+# 运行时用 Docker Volume 保存
+uploads

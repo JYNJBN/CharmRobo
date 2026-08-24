@@ -355,3 +355,37 @@ async def get_devices_by_user_id(
     rows = result.mappings().all()
 
     return [UserDeviceResponse.model_validate(row) for row in rows]
+
+
+async def unbind_device_for_user(
+    db: AsyncSession,
+    user_id: int,
+    device_id: int,
+) -> None:
+    """
+    解除当前用户和指定设备的绑定关系。
+
+    这里只逻辑删除 user_device 关系，不删除 device 硬件记录，
+    因此设备身份和永久密钥仍可用于后续重新绑定。
+    """
+
+    result = await db.execute(
+        select(UserDevice).where(
+            UserDevice.user_id == user_id,
+            UserDevice.device_id == device_id,
+            UserDevice.deleted == 0,
+        )
+    )
+    binding = result.scalar_one_or_none()
+
+    if binding is None:
+        raise ValueError("设备不存在或已经解除绑定")
+
+    binding.deleted = 1
+    binding.unbind_time = local_now()
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
