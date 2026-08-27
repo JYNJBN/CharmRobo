@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timezone
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -16,14 +15,11 @@ from app.services.device_binding_service import (
     delete_bind_ticket,
     get_bind_ticket,
 )
+from app.utils.tools import local_now
 
 logger = logging.getLogger(__name__)
 
 
-def local_now() -> datetime:
-    """生成与当前 MySQL DATETIME 字段兼容的本地无时区时间。"""
-
-    return datetime.now(timezone.utc).astimezone().replace(tzinfo=None)
 
 
 async def get_device_by_sn(
@@ -86,6 +82,12 @@ async def bootstrap_device(
     丢失后设备无法安全重试。
     """
 
+    logger.info(
+        "设备绑定请求开始 device_sn=%s product_key=%s",
+        data.device_sn,
+        data.product_key,
+    )
+
     # ================================================================
     # 公共入口：先根据 SN 判断这台设备在 MySQL 中是否已经存在。
     #
@@ -95,6 +97,13 @@ async def bootstrap_device(
     #    或后台预先导入了设备 SN。
     # ================================================================
     existing_device = await get_device_by_sn(db, data.device_sn)
+    logger.info(
+        "设备查询完成 device_sn=%s exists=%s device_id=%s initialized=%s",
+        data.device_sn,
+        existing_device is not None,
+        existing_device.id if existing_device is not None else None,
+        bool(existing_device and existing_device.device_secret_hash),
+    )
 
     # ================================================================
     # 路线 2：设备已经初始化过（存在密钥摘要）。
@@ -113,6 +122,11 @@ async def bootstrap_device(
             existing_device.device_secret_hash,
         ):
             # 路线 5：SN 已存在，但密钥错误。
+            logger.warning(
+                "设备密钥校验失败 device_sn=%s device_id=%s",
+                data.device_sn,
+                existing_device.id,
+            )
             raise ValueError("设备已经初始化，但设备密钥不正确")
 
         active_owner = await get_active_owner_binding(
@@ -138,6 +152,12 @@ async def bootstrap_device(
             except ValueError:
                 # 路线 2A-1：绑定码已被上次成功请求删除，或者已过期。
                 # 设备和 owner 都存在且密钥正确，因此按幂等成功处理。
+                logger.info(
+                    "设备绑定按幂等重试成功 device_sn=%s device_id=%s owner_user_id=%s",
+                    data.device_sn,
+                    existing_device.id,
+                    active_owner.user_id,
+                )
                 return existing_device
 
             if retry_ticket_data.get("device_sn") != data.device_sn:
@@ -145,15 +165,33 @@ async def bootstrap_device(
 
             retry_user_id = retry_ticket_data.get("user_id")
             if retry_user_id is None:
+                logger.warning(
+                    "设备绑定码用户信息缺失 device_sn=%s device_id=%s",
+                    data.device_sn,
+                    existing_device.id,
+                )
                 raise ValueError("绑定码中的用户数据不完整")
 
             if int(retry_user_id) != int(active_owner.user_id):
                 # 路线 6：设备已有其他 owner，拒绝新用户直接抢绑。
+                logger.warning(
+                    "设备绑定被拒绝：设备已有其他用户 device_sn=%s device_id=%s requested_user_id=%s owner_user_id=%s",
+                    data.device_sn,
+                    existing_device.id,
+                    retry_user_id,
+                    active_owner.user_id,
+                )
                 raise ValueError("设备已经被其他用户绑定")
 
             # 路线 2A-2：同一个 owner 使用新的有效绑定码重复请求。
             # 删除多余绑定码后直接返回已有设备。
             await delete_bind_ticket(redis, data.bind_ticket)
+            logger.info(
+                "设备重复绑定成功 device_sn=%s device_id=%s user_id=%s",
+                data.device_sn,
+                existing_device.id,
+                active_owner.user_id,
+            )
             return existing_device
 
     # ================================================================
@@ -171,12 +209,27 @@ async def bootstrap_device(
     ticket_user_id = ticket_data.get("user_id")
 
     if not ticket_device_sn or ticket_user_id is None:
+        logger.warning(
+            "设备绑定失败：绑定码数据不完整 device_sn=%s",
+            data.device_sn,
+        )
         raise ValueError("绑定码中的数据不完整")
 
     if ticket_device_sn != data.device_sn:
+        logger.warning(
+            "设备绑定失败：绑定码与设备不匹配 device_sn=%s ticket_device_sn=%s",
+            data.device_sn,
+            ticket_device_sn,
+        )
         raise ValueError("绑定码与当前设备不匹配")
 
     user_id = int(ticket_user_id)
+    logger.info(
+        "设备绑定码校验成功 device_sn=%s user_id=%s existing_device=%s",
+        data.device_sn,
+        user_id,
+        existing_device is not None,
+    )
 
     if existing_device is None:
         # ============================================================
@@ -191,12 +244,17 @@ async def bootstrap_device(
             firmware_version=data.firmware_version,
             hardware_version=data.hardware_version,
             device_secret_hash=hash_device_secret(data.device_secret),
-            secret_version=1,
+            secret_version=1,  # noqa: F821
             secret_updated_time=local_now(),
             status=1,
             deleted=0,
         )
         db.add(device)
+        logger.info(
+            "准备创建新设备记录 device_sn=%s user_id=%s",
+            data.device_sn,
+            user_id,
+        )
     else:
         # ============================================================
         # 路线 3 / 路线 4：设备记录已经存在。
@@ -209,6 +267,11 @@ async def bootstrap_device(
             # 路线 4：第一次把硬件密钥的摘要登记到数据库。
             device.device_secret_hash = hash_device_secret(data.device_secret)
             device.secret_updated_time = local_now()
+            logger.info(
+                "准备补充设备密钥摘要 device_sn=%s device_id=%s",
+                data.device_sn,
+                device.id,
+            )
 
         device.product_key = data.product_key
         device.firmware_version = data.firmware_version
@@ -229,6 +292,13 @@ async def bootstrap_device(
         )
         if active_owner is not None and int(active_owner.user_id) != user_id:
             # 路线 6：事务执行期间发现设备已经被其他用户绑定。
+            logger.warning(
+                "设备绑定事务校验失败：设备已被其他用户绑定 device_sn=%s device_id=%s requested_user_id=%s owner_user_id=%s",
+                data.device_sn,
+                device.id,
+                user_id,
+                active_owner.user_id,
+            )
             raise ValueError("设备已经被其他用户绑定")
 
         binding = await get_user_device_binding(
@@ -247,6 +317,11 @@ async def bootstrap_device(
                 deleted=0,
             )
             db.add(binding)
+            logger.info(
+                "准备创建用户设备绑定关系 device_id=%s user_id=%s",
+                device.id,
+                user_id,
+            )
         else:
             # 路线 3：同一用户解绑后再次绑定，恢复旧关系记录。
             # 不重新 INSERT，避免 (user_id, device_id) 唯一约束冲突。
@@ -254,10 +329,22 @@ async def bootstrap_device(
             binding.deleted = 0
             binding.unbind_time = None
             binding.bind_time = local_now()
+            logger.info(
+                "准备恢复用户设备绑定关系 device_id=%s user_id=%s binding_id=%s",
+                device.id,
+                user_id,
+                binding.id,
+            )
 
         # device 和 user_device 在同一 MySQL 事务中提交。
         await db.commit()
         await db.refresh(device)
+        logger.info(
+            "设备绑定数据库事务提交成功 device_sn=%s device_id=%s user_id=%s",
+            data.device_sn,
+            device.id,
+            user_id,
+        )
 
         # Redis 清理失败不应把已成功的数据库事务变成 500；
         # 绑定码本身仍会在五分钟后自动过期。
@@ -266,6 +353,12 @@ async def bootstrap_device(
         except Exception:
             logger.exception("删除设备绑定码失败")
 
+        logger.info(
+            "设备绑定请求完成 device_sn=%s device_id=%s user_id=%s",
+            data.device_sn,
+            device.id,
+            user_id,
+        )
         return device
 
     except IntegrityError as exc:
@@ -280,6 +373,12 @@ async def bootstrap_device(
         # 就把 B 也按幂等成功处理。
         # ============================================================
         await db.rollback()
+        logger.warning(
+            "设备绑定发生数据库并发或唯一约束冲突 device_sn=%s user_id=%s error=%s",
+            data.device_sn,
+            user_id,
+            exc,
+        )
 
         # 两个相同请求并发时，其中一个可能已经创建成功。
         concurrent_device = await get_device_by_sn(db, data.device_sn)
@@ -296,6 +395,12 @@ async def bootstrap_device(
                 int(concurrent_device.id),
             )
             if concurrent_owner is not None:
+                logger.info(
+                    "设备绑定并发请求按幂等成功 device_sn=%s device_id=%s user_id=%s",
+                    data.device_sn,
+                    concurrent_device.id,
+                    concurrent_owner.user_id,
+                )
                 return concurrent_device
 
         raise ValueError("设备初始化或绑定失败") from exc
@@ -304,6 +409,11 @@ async def bootstrap_device(
         # 其他任何异常：回滚当前 MySQL 事务并继续向上抛出。
         # 由于绑定码尚未删除，修复问题后仍可以继续重试。
         await db.rollback()
+        logger.exception(
+            "设备绑定事务失败 device_sn=%s user_id=%s",
+            data.device_sn,
+            locals().get("user_id"),
+        )
         raise
 
 
@@ -354,6 +464,12 @@ async def get_devices_by_user_id(
     # }
     rows = result.mappings().all()
 
+    logger.info(
+        "查询用户绑定设备成功 user_id=%s device_count=%s",
+        user_id,
+        len(rows),
+    )
+
     return [UserDeviceResponse.model_validate(row) for row in rows]
 
 
@@ -369,6 +485,12 @@ async def unbind_device_for_user(
     因此设备身份和永久密钥仍可用于后续重新绑定。
     """
 
+    logger.info(
+        "解除设备绑定请求开始 user_id=%s device_id=%s",
+        user_id,
+        device_id,
+    )
+
     result = await db.execute(
         select(UserDevice).where(
             UserDevice.user_id == user_id,
@@ -379,6 +501,11 @@ async def unbind_device_for_user(
     binding = result.scalar_one_or_none()
 
     if binding is None:
+        logger.warning(
+            "解除设备绑定失败：绑定关系不存在 user_id=%s device_id=%s",
+            user_id,
+            device_id,
+        )
         raise ValueError("设备不存在或已经解除绑定")
 
     binding.deleted = 1
@@ -386,6 +513,17 @@ async def unbind_device_for_user(
 
     try:
         await db.commit()
+        logger.info(
+            "解除设备绑定成功 user_id=%s device_id=%s binding_id=%s",
+            user_id,
+            device_id,
+            binding.id,
+        )
     except Exception:
         await db.rollback()
+        logger.exception(
+            "解除设备绑定事务失败 user_id=%s device_id=%s",
+            user_id,
+            device_id,
+        )
         raise

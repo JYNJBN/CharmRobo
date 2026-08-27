@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。
     public_base_url: str | None = None
+    # 上下文和摘要配置，单位都是消息条数，不是问答轮数
+    short_term_context_messages: int = 20
+    summary_batch_messages: int = 6
     @property
     def alembic_database_url(self) -> str:
         return (

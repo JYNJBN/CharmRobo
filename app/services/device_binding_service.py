@@ -1,10 +1,12 @@
 import json
+import logging
 import secrets
 from typing import Any
 
 from redis.asyncio import Redis
 
 BIND_TICKET_EXPIRE_SECONDS = 300
+logger = logging.getLogger(__name__)
 
 
 async def create_bind_ticket(
@@ -31,6 +33,12 @@ async def create_bind_ticket(
         json.dumps(ticket_data),
         ex=BIND_TICKET_EXPIRE_SECONDS,
     )
+    logger.info(
+        "创建设备绑定码成功 user_id=%s device_sn=%s expires_in=%s",
+        user_id,
+        device_sn,
+        BIND_TICKET_EXPIRE_SECONDS,
+    )
     return ticket
 
 
@@ -49,6 +57,7 @@ async def get_bind_ticket(
     ticket_json = await redis.get(redis_key)
 
     if ticket_json is None:
+        logger.warning("设备绑定码不存在或已过期")
         raise ValueError("绑定凭证不存在、已经使用或已经过期")
 
     return json.loads(ticket_json)
@@ -60,4 +69,5 @@ async def delete_bind_ticket(
 ) -> None:
     """设备和用户关系提交成功后删除一次性绑定码。"""
 
-    await redis.delete(f"device:bind:{ticket}")
+    deleted_count = await redis.delete(f"device:bind:{ticket}")
+    logger.info("删除设备绑定码完成 deleted_count=%s", deleted_count)

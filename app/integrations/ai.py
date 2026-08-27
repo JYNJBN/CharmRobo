@@ -17,8 +17,7 @@ logger = logging.getLogger("uvicorn.error")
 
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 SYSTEM_INSTRUCTIONS = (
-    "你是由深圳市创梦龙公司开发的小梦机器人。"
-    "回答尽可能简短，优先用两到三句话回答。"
+    "你是由深圳市创梦龙公司开发的小梦机器人。回答尽可能简短，优先用两到三句话回答。"
 )
 MAX_OUTPUT_TOKENS = 300
 
@@ -38,16 +37,20 @@ def get_ark_client() -> AsyncOpenAI:
     )
 
 
-async def chat(text: str, trace_id: str = "standalone") -> str:
+async def chat(
+    text: str,
+    trace_id: str = "standalone",
+    instructions: str = SYSTEM_INSTRUCTIONS,
+) -> str:
     """使用 Responses API 进行一次性文字对话。"""
 
     client = get_ark_client()
-
+    print(text,'text',instructions,'instructions')
     started_at = perf_counter()
     try:
         response = await client.responses.create(
             model=settings.ark_model,
-            instructions=SYSTEM_INSTRUCTIONS,
+            instructions=instructions,
             input=text,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             # 保存响应，后续接入 previous_response_id 时可以继续使用。
@@ -72,10 +75,13 @@ async def chat(text: str, trace_id: str = "standalone") -> str:
 
 
 async def stream_chat(
-    text: str,
+    text: str | None = None,
+    *,
+    messages: list[dict[str, str]] | None = None,
     previous_response_id: str | None = None,
     response_state: dict[str, str | None] | None = None,
     trace_id: str = "standalone",
+    instructions: str = SYSTEM_INSTRUCTIONS,
 ) -> AsyncIterator[str]:
     """使用 Responses API 流式返回文字增量。"""
 
@@ -89,12 +95,22 @@ async def stream_chat(
 
     try:
         create_started_at = perf_counter()
+        if messages is None and text is None:
+            raise ValueError("text 或 messages 不能同时为空")
+        # llm_input =  text if messages is None else messages
+        llm_input = ""
+        if messages is None:
+            if text is None:
+                raise ValueError("text 或 messages 不能同时为空")
+            llm_input = text
+        else:
+            llm_input = messages
         stream = await client.responses.create(
             model=settings.ark_model,
-            instructions=SYSTEM_INSTRUCTIONS,
-            input=text,
+            instructions=instructions,
+            input=llm_input,
             max_output_tokens=MAX_OUTPUT_TOKENS,
-            previous_response_id=previous_response_id,
+            # previous_response_id=previous_response_id,
             store=True,
             stream=True,
             extra_body={
@@ -130,8 +146,7 @@ async def stream_chat(
                     if not first_delta_received:
                         first_delta_received = True
                         logger.info(
-                            "[VOICE-TIMING][%s][LLM] 收到首个文字增量 "
-                            "ttft=%.3fs",
+                            "[VOICE-TIMING][%s][LLM] 收到首个文字增量 ttft=%.3fs",
                             trace_id,
                             perf_counter() - started_at,
                         )

@@ -39,6 +39,7 @@ async def get_user_info(
     而是 get_current_user() 验证 JWT 后注入的。
     """
     user = await get_user_by_id(db, current_user_id)
+    print(current_user_id,'current_user_id')
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

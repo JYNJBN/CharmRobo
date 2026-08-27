@@ -22,6 +22,8 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import Response
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.integrations.ai import chat, stream_chat
 from app.integrations.stt import (
     ASR_FLAG_FINAL,
@@ -43,6 +45,18 @@ from app.schemas.voice import (
     VoiceChatRequest,
     VoiceChatResponse,
 )
+from app.services.conversation import SentenceSplitter, run_turn
+from app.services.conversation_service import (
+    add_conversation_message,
+    create_conversation,
+    get_latest_conversation_by_device,
+    get_recent_messages,
+)
+from app.services.conversation_summary_service import (
+    generate_conversation_summary,
+    get_latest_summary_end_message_id,
+)
+from app.services.device_service import get_device_by_sn
 
 router = APIRouter(prefix="/voice", tags=["AI 语音"])
 logger = logging.getLogger("uvicorn.error")
@@ -95,7 +109,46 @@ async def _send_ws_json(client: WebSocket, data: dict[str, str]) -> None:
         await client.send_json(data)
     except (RuntimeError, WebSocketDisconnect):
         pass
+async def summarize_conversation_in_background(
+    conversation_id: int,
+    device_id: int | None,
+    trace_id: str,
+) -> None:
+    """后台生成会话摘要，不阻塞当前语音回答。"""
 
+    try:
+        async with AsyncSessionLocal() as db:
+            last_covered_message_id = (
+                await get_latest_summary_end_message_id(
+                    db,
+                    conversation_id=conversation_id,
+                )
+            )
+
+            summary = await generate_conversation_summary(
+                db,
+                conversation_id=conversation_id,
+                device_id=device_id,
+                last_covered_message_id=last_covered_message_id,
+                limit=settings.summary_batch_messages,
+                trace_id=f"{trace_id}-summary",
+            )
+
+            if summary is not None:
+                logger.info(
+                    "[SUMMARY][%s] 摘要生成成功 "
+                    "conversation_id=%s summary_id=%s",
+                    trace_id,
+                    conversation_id,
+                    summary.id,
+                )
+
+    except Exception:
+        logger.exception(
+            "[SUMMARY][%s] 后台生成摘要失败 conversation_id=%s",
+            trace_id,
+            conversation_id,
+        )
 
 @router.websocket("/tts-stream")
 async def tts_stream(client: WebSocket) -> None:
@@ -464,71 +517,163 @@ async def stream_voice(client: WebSocket) -> None:
     旧的“流式 STT”实现保留在 ``/stream-realtime``，本路由使用普通 STT。
     """
 
+    # 第 1 步：接受客户端的 WebSocket 握手，正式建立长连接。
     await client.accept()
 
-    # 主 WebSocket 的所有发送都经过同一把锁。
+    # 第 2 步：创建发送锁，统一保护主 WebSocket 的所有发送操作。
     # LLM 文字任务和 TTS worker 会并发发送消息，必须保证一个消息发送完后再发下一个。
     send_lock = asyncio.Lock()
 
+    # 第 3 步：封装 JSON 发送方法，确保发送过程经过发送锁。
     async def send_json(data: dict[str, object]) -> None:
         async with send_lock:
             await client.send_json(data)
 
+    # 第 4 步：封装二进制发送方法，确保 TTS PCM 分片不会与其他消息交叉发送。
     async def send_bytes(data: bytes) -> None:
         async with send_lock:
             await client.send_bytes(data)
 
-    await send_json({"type": "ready"})
-
+    # 第 6 步：初始化本条长连接和当前录音轮次的状态。
     is_recording = False
     pcm_buffer = bytearray()
-    previous_response_id: str | None = None
+    conversation_id: int | None = None
+    device_id: int | None = None
+    history_messages: list[dict[str, str]] = []
+    MAX_HISTORY_MESSAGES = settings.short_term_context_messages
     recording_started_at: float | None = None
+    session_command = await client.receive_json()
+    # 第一条消息要是
+    # {"type": "session_start", "device_sn": "你的设备SN", "conversation_id": null} 格式
+    if session_command.get("type") != "session_start":
+        await send_json(
+            {
+                "type": "error",
+                "detail": "第一条消息必须是 session_start",
+            }
+        )
+        await client.close()
+        return
+    device_sn = session_command.get("device_sn")
+    # requested_conversation_id = session_command.get("conversation_id")
+    if not device_sn:
+        await send_json(
+            {
+                "type": "error",
+                "detail": "缺少 device_sn",
+            }
+        )
+        await client.close()
+        return
+    # 获取deviceid
+    async with AsyncSessionLocal() as db:
+        device = await get_device_by_sn(db, device_sn)
+
+        if device is None:
+            await send_json(
+                {
+                    "type": "error",
+                    "detail": "设备不存在或已删除",
+                }
+            )
+            await client.close()
+            return
+
+        if device.status != 1:
+            await send_json(
+                {
+                    "type": "error",
+                    "detail": "设备已被禁用",
+                }
+            )
+            await client.close()
+            return
+        device_id = device.id
+    async with AsyncSessionLocal() as db:
+        conversation = await get_latest_conversation_by_device(
+            db,
+            device_id=device_id,
+        )
+        if conversation is None:
+            conversation = await create_conversation(
+                db,
+                device_id=device_id,
+            )
+
+        conversation_id = conversation.id
+
+        history_messages = await get_recent_messages(
+            db,
+            conversation_id=conversation_id,
+            limit=MAX_HISTORY_MESSAGES,
+        )
+
+    await send_json(
+        {
+            "type": "session_ready",
+            "device_sn": device_sn,
+            "history_count": len(history_messages),
+        }
+    )
+    # 第 5 步：通知客户端连接已经准备好，可以开始发送录音。
+    await send_json({"type": "ready"})
     try:
+        # 第 7 步：持续接收客户端消息，一条连接可以处理多轮语音交互。
         while True:
             message = await client.receive()
 
+            # 第 8 步：客户端主动断开时，结束当前 WebSocket 处理函数。
             if message["type"] == "websocket.disconnect":
                 return
 
             # 录音中的二进制消息是 16kHz/16bit/单声道 PCM。
             pcm = message.get("bytes")
             if pcm:
+                # 第 9 步：录音状态下缓存客户端上传的 PCM 音频数据。
                 if is_recording:
                     pcm_buffer.extend(pcm)
                 continue
 
+            # 第 10 步：读取客户端发送的文本消息，并忽略空消息。
             raw_text = message.get("text")
             if not raw_text:
                 continue
 
+            # 第 11 步：解析 JSON 指令，获取客户端要求执行的操作类型。
             command = json.loads(raw_text)
             command_type = command.get("type")
 
+            # 第 12 步：处理心跳请求，保持连接活跃。
             if command_type == "ping":
                 await send_json({"type": "pong"})
                 continue
 
+            # 第 13 步：处理开始录音指令。
             if command_type == "start":
                 if is_recording:
+                    # 防止客户端重复开始同一轮录音。
                     await send_json({"type": "error", "detail": "当前已经在录音中。"})
                     continue
 
+                # 清空上一轮缓存，开始记录新一轮录音的 PCM 数据。
                 pcm_buffer.clear()
                 is_recording = True
                 recording_started_at = perf_counter()
                 await send_json({"type": "recording_started"})
                 continue
 
+            # 第 14 步：只处理录音状态下的 stop 指令，其他指令直接忽略。
             if command_type != "stop" or not is_recording:
                 continue
 
+            # 第 15 步：结束录音并固定本轮音频内容，后续处理不再修改 pcm_buffer。
             is_recording = False
             pcm = bytes(pcm_buffer)
             pcm_buffer.clear()
             trace_id = uuid.uuid4().hex[:8]
             round_started_at = perf_counter()
 
+            # 第 16 步：计算录音耗时、音频时长和 PCM 大小，便于排查链路延迟。
             recording_elapsed = (
                 round_started_at - recording_started_at
                 if recording_started_at is not None
@@ -545,15 +690,18 @@ async def stream_voice(client: WebSocket) -> None:
                 len(pcm),
             )
 
+            # 第 17 步：没有收到音频时直接返回错误，并准备下一轮录音。
             if not pcm:
                 await send_json({"type": "error", "detail": "本轮没有收到音频。"})
                 await send_json({"type": "ready"})
                 continue
 
+            # 第 18 步：通知客户端开始进行语音识别。
             await send_json({"type": "stt_start"})
 
             try:
                 # 普通 STT：完整一轮 PCM 收完后，转换成 WAV 并请求一次。
+                # 第 19 步：调用 STT 服务，将完整 PCM 音频转换为用户文本。
                 stt_started_at = perf_counter()
                 final_text = await transcribe_pcm(
                     pcm,
@@ -562,15 +710,31 @@ async def stream_voice(client: WebSocket) -> None:
                     sample_width=2,
                     trace_id=trace_id,
                 )
+                # 删除stt录音
+                del pcm
                 logger.info(
                     "[VOICE-TIMING][%s][PIPELINE] STT 阶段结束 elapsed=%.3fs",
                     trace_id,
                     perf_counter() - stt_started_at,
                 )
+                # 第 20 步：把识别出的最终文本发送给客户端，并通知客户端开始等待回答。
+                if conversation_id is None:
+                    raise RuntimeError("会话初始化失败，无法保存消息")
+
+                async with AsyncSessionLocal() as db:
+                    await add_conversation_message(
+                        db,
+                        conversation_id=conversation_id,
+                        role="user",
+                        content=final_text,
+                        source="voice",
+                    )
+
                 await send_json({"type": "final", "text": final_text})
                 await send_json({"type": "reply_start", "text": final_text})
 
                 # TTS worker 与 LLM 生成并行：LLM 继续产出文字，worker 负责合成已经完成的句子。
+                # 第 21 步：创建 TTS 队列和计时状态，用于异步处理已完成的句子。
                 tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
                 timing_state: dict[str, float | int | None] = {
                     "first_tts_audio_at": None,
@@ -587,17 +751,20 @@ async def stream_voice(client: WebSocket) -> None:
                 ) -> None:
                     """按顺序消费句子，并把 TTS PCM 复用主 WebSocket 发给小程序。"""
 
+                    # 第 22 步：启动 TTS worker，持续从队列中取出句子进行语音合成。
                     state["tts_worker_started_at"] = perf_counter()
                     while True:
                         sentence = await queue.get()
                         try:
                             if sentence is None:
+                                # 收到结束标记，说明 LLM 已经没有更多句子需要合成。
                                 return
 
                             # worker 创建后会先等 LLM 产出完整句子；这里才是 TTS 真正开始。
                             if state["tts_active_started_at"] is None:
                                 state["tts_active_started_at"] = perf_counter()
 
+                            # 第 23 步：记录当前句子序号，并通知客户端即将发送该句的音频。
                             sentence_no = int(state["tts_sentence_count"] or 0) + 1
                             state["tts_sentence_count"] = sentence_no
 
@@ -614,6 +781,7 @@ async def stream_voice(client: WebSocket) -> None:
 
                             # 这里的 stream_speech_pcm 是 FastAPI 到火山 TTS 的内部连接。
                             # 它产生的每个 PCM 分片，都通过设备主 WebSocket 转发出去。
+                            # 第 24 步：调用 TTS 服务，并逐片转发生成的 PCM 音频。
                             async for pcm_chunk in stream_speech_pcm(
                                 sentence,
                                 "zh_female_vv_uranus_bigtts",
@@ -627,29 +795,30 @@ async def stream_voice(client: WebSocket) -> None:
                                         "[VOICE-TIMING][%s][PIPELINE] 首段 TTS 音频开始转发 "
                                         "elapsed_from_stop=%.3fs",
                                         current_trace_id,
-                                        first_tts_audio_at
-                                        - current_round_started_at,
+                                        first_tts_audio_at - current_round_started_at,
                                     )
                                 await send_bytes(pcm_chunk)
 
+                            # 第 25 步：当前句子的所有音频发送完成，通知客户端结束本句播放。
                             await send_json({"type": "tts_end"})
                         except Exception as exc:  # noqa: BLE001 - 单句 TTS 失败不影响文字
+                            # 单句 TTS 失败只通知客户端，不中断剩余文字和后续句子的处理。
                             await send_json({"type": "tts_error", "detail": str(exc)})
                         finally:
+                            # 无论成功还是失败，都标记当前队列任务已经处理完毕。
                             queue.task_done()
 
+                # 第 26 步：后台启动 TTS worker，使 LLM 生成文字和 TTS 合成可以并行进行。
                 tts_task = asyncio.create_task(tts_worker())
                 full_reply = ""
-                sentence_buffer = ""
-                response_state = {
-                    "response_id": None,
-                }
+                splitter = SentenceSplitter()
                 llm_started_at = perf_counter()
                 first_reply_delta_received = False
-                async for delta in stream_chat(
+                # 第 27 步：调用共享对话层 run_turn，逐段接收 LLM 回答文本。
+                async for delta in run_turn(
                     final_text,
-                    previous_response_id=previous_response_id,
-                    response_state=response_state,
+                    history_messages,
+                    conversation_id,
                     trace_id=trace_id,
                 ):
                     if not first_reply_delta_received:
@@ -662,27 +831,18 @@ async def stream_voice(client: WebSocket) -> None:
                             perf_counter() - llm_started_at,
                         )
                     full_reply += delta
-                    sentence_buffer += delta
 
-                    # 文字增量仍然立即发送，前端可以边生成边显示。
+                    # 第 28 步：立即转发每个文字增量，让前端边生成边显示回答。
                     await send_json({"type": "reply_delta", "delta": delta})
 
-                    # 一个 delta 可能包含多个句子，所以使用 while 循环全部切出来。
-                    while True:
-                        match = re.search(
-                            r"(.+?[。！？；!?;])",
-                            sentence_buffer,
-                            re.DOTALL,
-                        )
-                        if not match:
-                            break
+                    # 第 29 步：从累计文本中提取完整句子，交给 TTS worker 排队合成。
+                    # 分句逻辑已抽到共享层 SentenceSplitter，保证 /stream 与
+                    # 未来 /dialogue/ws 复用同一套切句规则。
+                    for sentence in splitter.feed(delta):
+                        # put 不会调用 TTS，只是把句子交给后台 worker 排队。
+                        await tts_queue.put(sentence)
 
-                        sentence = match.group(1).strip()
-                        sentence_buffer = sentence_buffer[match.end() :]
-                        if sentence:
-                            # put 不会调用 TTS，只是把句子交给后台 worker 排队。
-                            await tts_queue.put(sentence)
-
+                # 第 30 步：LLM 生成结束，记录阶段耗时。
                 logger.info(
                     "[VOICE-TIMING][%s][PIPELINE] LLM 文字阶段结束 elapsed=%.3fs",
                     trace_id,
@@ -690,11 +850,42 @@ async def stream_voice(client: WebSocket) -> None:
                 )
 
                 # 最后一段可能没有标点，回答结束时也要送进 TTS 队列。
-                if sentence_buffer.strip():
-                    await tts_queue.put(sentence_buffer.strip())
-                if response_state["response_id"]:
-                    previous_response_id = response_state["response_id"]
+                # 第 31 步：把没有标点结尾的剩余文本也加入 TTS 队列。
+                for sentence in splitter.flush():
+                    await tts_queue.put(sentence)
+                #     添加历史聊天记录
+                async with AsyncSessionLocal() as db:
+                    await add_conversation_message(
+                        db,
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=full_reply,
+                        source="voice",
+                    )
+                asyncio.create_task(
+                    summarize_conversation_in_background(
+                        conversation_id=conversation_id,
+                        device_id=device_id,
+                        trace_id=trace_id,
+                    )
+                )
+                history_messages.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": final_text,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": full_reply,
+                        },
+                    ]
+                )
+                # 如果聊天记录大于20条对话只取最新20条
+                if len(history_messages) > MAX_HISTORY_MESSAGES:
+                    del history_messages[:-MAX_HISTORY_MESSAGES]
                 # 文字回答已经完整，通知前端文字结束。
+                # 第 32 步：发送完整回答文本，通知客户端 LLM 阶段结束。
                 await send_json(
                     {
                         "type": "reply_end",
@@ -704,9 +895,11 @@ async def stream_voice(client: WebSocket) -> None:
                 )
 
                 # 等所有句子的 TTS 都发送完成，再结束本轮。
+                # 第 33 步：向 worker 发送结束标记，并等待所有 TTS 队列任务完成。
                 await tts_queue.put(None)
                 await tts_queue.join()
                 await tts_task
+                # 第 34 步：记录 TTS 阶段和整轮语音交互的耗时。
                 tts_worker_started_at = timing_state["tts_worker_started_at"]
                 tts_active_started_at = timing_state["tts_active_started_at"]
                 if isinstance(tts_worker_started_at, float) and isinstance(
@@ -727,6 +920,7 @@ async def stream_voice(client: WebSocket) -> None:
                     perf_counter() - round_started_at,
                 )
             except HTTPException as exc:
+                # 第 35 步：处理可预期的业务异常，并把错误信息返回给客户端。
                 logger.info(
                     "[VOICE-TIMING][%s][PIPELINE] 本轮失败 elapsed=%.3fs error=%s",
                     trace_id,
@@ -735,6 +929,7 @@ async def stream_voice(client: WebSocket) -> None:
                 )
                 await send_json({"type": "error", "detail": str(exc.detail)})
             except Exception as exc:
+                # 第 36 步：记录未预期异常，并返回通用错误信息。
                 logger.exception(
                     "[VOICE-TIMING][%s][PIPELINE] 本轮异常 elapsed=%.3fs",
                     trace_id,
@@ -742,11 +937,13 @@ async def stream_voice(client: WebSocket) -> None:
                 )
                 await send_json({"type": "error", "detail": str(exc)})
 
-            # 连接继续保留，等待下一轮 start。
+            # 第 37 步：本轮成功或失败后都保留连接，通知客户端可以开始下一轮录音。
             await send_json({"type": "ready"})
     except (WebSocketDisconnect, asyncio.CancelledError):
+        # 第 38 步：客户端断开或任务被取消时，安静结束连接处理。
         return
     except Exception as exc:  # noqa: BLE001 - 连接级错误才退出
+        # 第 39 步：处理连接级异常；此时无法继续当前循环，只尝试发送错误。
         await _send_ws_json(client, {"type": "error", "detail": str(exc)})
 
 
