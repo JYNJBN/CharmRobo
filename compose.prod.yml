@@ -12,7 +12,9 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-    ports: []
+    # 只绑定服务器本机，配合 SSH 隧道供 Navicat 使用，不暴露到公网。
+    ports:
+      - "127.0.0.1:15432:5432"
 
     healthcheck:
       test:
@@ -49,6 +51,9 @@ services:
       retries: 20
 
   backend:
+    networks:
+      - default
+      - nginx_net
     build: .
     container_name: charming-backend
     restart: unless-stopped
@@ -96,3 +101,11 @@ volumes:
   uploads_data:
   caddy_data:
   caddy_config:
+
+networks:
+  default:
+    name: charmrobo_default
+
+  nginx_net:
+    external: true
+    name: charming_charming-net
