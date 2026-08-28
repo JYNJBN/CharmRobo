@@ -1,24 +1,23 @@
 services:
-  mysql:
-    image: mysql:8.4
-    container_name: charming-mysql
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: charming-postgres
     restart: unless-stopped
 
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
 
     volumes:
-      - mysql_data:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
 
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
+    ports: []
 
     healthcheck:
       test:
         - CMD-SHELL
-        - mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD}
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 5s
       timeout: 5s
       retries: 20
@@ -39,6 +38,8 @@ services:
     volumes:
       - redis_data:/data
 
+    ports: []
+
     healthcheck:
       test:
         - CMD-SHELL
@@ -56,10 +57,10 @@ services:
       - .env
 
     # 容器内部不能使用 127.0.0.1 连接其他容器。
-    # mysql 和 redis 是上面的服务名称。
+    # postgres 和 redis 是上面的服务名称。
     environment:
       DEBUG: "false"
-      MYSQL_HOST: mysql
+      POSTGRES_HOST: postgres
       REDIS_HOST: redis
       UPLOAD_DIR: /app/uploads
 
@@ -70,7 +71,7 @@ services:
       - uploads_data:/app/uploads
 
     depends_on:
-      mysql:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -90,7 +91,7 @@ services:
         --proxy-headers
         --forwarded-allow-ips "*"
 volumes:
-  mysql_data:
+  postgres_data:
   redis_data:
   uploads_data:
   caddy_data:

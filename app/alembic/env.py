@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.core.database import Base
 
 # 导入所有模型，确保 Base.metadata 包含完整的表结构
-from app.models import user  # noqa: F401
+import app.models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

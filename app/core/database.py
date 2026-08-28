@@ -9,12 +9,12 @@ class Base(DeclarativeBase):
 
 
 DATABASE_URL = (
-    f"mysql+aiomysql://"
-    f"{settings.mysql_user}:{settings.mysql_password}"
-    f"@{settings.mysql_host}:{settings.mysql_port}"
-    f"/{settings.mysql_database}?charset=utf8mb4"
+    f"postgresql+asyncpg://"
+    f"{settings.postgres_user}:{settings.postgres_password}"
+    f"@{settings.postgres_host}:{settings.postgres_port}"
+    f"/{settings.postgres_database}"
 )
-# 应用程序连接 MySQL 的总入口。
+# 应用程序连接 PostgreSQL 的总入口。
 engine = create_async_engine(
     DATABASE_URL,
     echo=settings.debug,

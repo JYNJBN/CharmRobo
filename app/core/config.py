@@ -5,12 +5,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str="Charming Device API"
     debug: bool=True
-    # mysql 配置
-    mysql_host: str = "127.0.0.1"
-    mysql_port: int = 3306
-    mysql_user: str = "root"
-    mysql_password: str
-    mysql_database: str = "charming"
+    # PostgreSQL 配置
+    postgres_host: str = "127.0.0.1"
+    postgres_port: int = 5432
+    postgres_user: str = "postgres"
+    postgres_password: str
+    postgres_database: str = "charming"
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -46,9 +46,9 @@ class Settings(BaseSettings):
     @property
     def alembic_database_url(self) -> str:
         return (
-            f"mysql+pymysql://"
-            f"{self.mysql_user}:{self.mysql_password}"
-            f"@{self.mysql_host}:{self.mysql_port}"
-            f"/{self.mysql_database}?charset=utf8mb4"
+            f"postgresql+psycopg://"
+            f"{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}"
+            f"/{self.postgres_database}"
         )
 settings = Settings()

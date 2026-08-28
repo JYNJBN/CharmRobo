@@ -30,14 +30,12 @@ class UserDevice(Base):
     )
     user_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("user.id"),
         index=True,
         nullable=False,
         comment="用户 ID",
     )
     device_id: Mapped[int] = mapped_column(
         BigInteger,
-        ForeignKey("device.id"),
         index=True,
         nullable=False,
         comment="设备 ID",
