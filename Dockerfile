@@ -14,8 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV UV_LINK_MODE=copy
 ENV UV_COMPILE_BYTECODE=1
 
-# 线上服务器访问 PyPI 可能较慢，默认使用国内镜像加快 Docker 构建。
-ARG UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 线上服务器访问 PyPI 可能较慢，腾讯云服务器默认使用腾讯云 PyPI 镜像加快 Docker 构建。
+ARG UV_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
 ENV UV_INDEX_URL=${UV_INDEX_URL}
 
 # 先复制依赖文件，利用 Docker 缓存。
