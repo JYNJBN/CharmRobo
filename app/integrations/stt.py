@@ -24,7 +24,7 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 ASR_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
 ASR_STREAM_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
@@ -227,9 +227,9 @@ async def transcribe_wav_legacy(audio: bytes) -> str:
 
     try:
         # 正常返回应该是 JSON；如果服务异常返回纯文本，也保留原始内容用于报错。
-        print(response,'stt response')
+        logger.debug("stt response: %s", response)
         data = response.json()
-        print(data,'stt response')
+        logger.debug("stt response data: %s", data)
 
     except ValueError:
         data = {"raw": response.text}
@@ -385,17 +385,17 @@ async def transcribe_wav(
         parse_started_at = perf_counter()
         try:
             data = response.json()
-            print("STT payload:", payload)
-            print(data,'sttData')
-            print(response.headers,'response.headers')
+            logger.debug("STT payload: %s", payload)
+            logger.debug("sttData: %s", data)
+            logger.debug("response.headers: %s", response.headers)
             result = data.get("result") or {}
             for utterance in result.get("utterances") or []:
                 additions = utterance.get("additions") or {}
-                print("语种标签：", additions.get("lid_lang"))
-            print("result additions：", result.get("additions"))
-            print("result additions:", data["result"].get("additions"))
+                logger.debug("语种标签：%s", additions.get("lid_lang"))
+            logger.debug("result additions：%s", result.get("additions"))
+            logger.debug("result additions: %s", data["result"].get("additions"))
             for item in data["result"].get("utterances", []):
-                print("utterance additions:", item.get("additions"))
+                logger.debug("utterance additions: %s", item.get("additions"))
         except ValueError:
             data = {"raw": response.text}
 

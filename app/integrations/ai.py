@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 
 from app.core.config import settings
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 SYSTEM_INSTRUCTIONS = (
@@ -45,7 +45,7 @@ async def chat(
     """使用 Responses API 进行一次性文字对话。"""
 
     client = get_ark_client()
-    print(text,'text',instructions,'instructions')
+    logger.debug("text=%s instructions=%s", text, instructions)
     started_at = perf_counter()
     try:
         response = await client.responses.create(

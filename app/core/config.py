@@ -5,6 +5,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str="Charming Device API"
     debug: bool=True
+    # 日志级别：DEBUG / INFO / WARNING / ERROR。
+    # 容器里用环境变量 LOG_LEVEL 覆盖，例如 LOG_LEVEL=DEBUG。
+    # 业务代码用 logging.getLogger(__name__) 打的日志受它控制。
+    log_level: str = "INFO"
     # PostgreSQL 配置
     postgres_host: str = "127.0.0.1"
     postgres_port: int = 5432
@@ -41,8 +45,18 @@ class Settings(BaseSettings):
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。
     public_base_url: str | None = None
     # 上下文和摘要配置，单位都是消息条数，不是问答轮数
-    short_term_context_messages: int = 20
+    short_term_context_messages: int = 6
     summary_batch_messages: int = 6
+    # SiliconFlow Embedding 配置
+    siliconflow_api_key: SecretStr | None = None
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_dimension: int = 1024
+    embedding_metric_type: str = "COSINE"
+    # 当前只维护对话摘要这一类向量数据
+    milvus_summary_collection: str = "conversation_summary_v1"
+    # Milvus 服务配置
+    milvus_uri: str = "http://127.0.0.1:19530"
     @property
     def alembic_database_url(self) -> str:
         return (

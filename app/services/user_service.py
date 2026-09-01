@@ -1,3 +1,5 @@
+import logging
+
 from sentry_sdk.integrations import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,6 +8,8 @@ from app.core.config import settings
 from app.core.security import create_access_token
 from app.models.user import User
 from app.schemas.user import LoginResponse, UserCreate, UserResponse, UserUpdate
+
+logger = logging.getLogger(__name__)
 
 
 async def get_user_by_id(
@@ -28,18 +32,18 @@ async def create_user(
     data: UserCreate,
 ) -> User:
     """创建用户，并提交事务。"""
-    print("Pydantic 数据：", data)
-    print("转换后的字典：", data.model_dump())
+    logger.debug("Pydantic 数据：%s", data)
+    logger.debug("转换后的字典：%s", data.model_dump())
     # openid 是微信用户唯一标识，创建前先检查是否重复。
     result = await db.execute(
         select(User).where(User.openid == data.openid)
     )
     if result.scalar_one_or_none() is not None:
         raise ValueError("openid 已经存在")
-    print(data)
+    logger.debug("data: %s", data)
     user = User(**data.model_dump())
-    print("SQLAlchemy 对象：", user)
-    print(user)
+    logger.debug("SQLAlchemy 对象：%s", user)
+    logger.debug("user: %s", user)
     db.add(user)
     await db.commit()
     await db.refresh(user)
@@ -60,7 +64,7 @@ async def update_user(
     # exclude_unset=True 很重要：没有传的字段不会覆盖原来的值。
     update_data = data.model_dump(exclude_unset=True)
     for field_name, value in update_data.items():
-        print(field_name, value)
+        logger.debug("%s=%s", field_name, value)
         setattr(user, field_name, value)
     await db.commit()
     await db.refresh(user)
@@ -88,10 +92,10 @@ async def login_service(db:AsyncSession,code:str) -> LoginResponse | None:
       4. 生成 JWT 返回前端
      """
     session = await get_wechat_session(code)
-    print("session", session)
+    logger.debug("session: %s", session)
     openid = session.get('openid')
     # session_key = session.get('session_key')  # 安全取，key 不存在返回 None，不抛错
-    print(openid,'openid')
+    logger.debug("openid: %s", openid)
     if not openid:
         error_message = session.get("errmsg", "微信登录失败")
         raise ValueError(error_message)
@@ -106,7 +110,7 @@ async def login_service(db:AsyncSession,code:str) -> LoginResponse | None:
         await db.commit()
         await db.refresh(user)
     user_response = UserResponse.model_validate(user)
-    print(user_response,'user_response')
+    logger.debug("user_response: %s", user_response)
     access_token, expires_in = create_access_token(user_response.id)
 
     return LoginResponse(

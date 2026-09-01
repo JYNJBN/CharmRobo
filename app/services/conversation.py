@@ -9,13 +9,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator
 
 from app.integrations.ai import stream_chat
+from app.integrations.embedding import embed_text
+from app.integrations.milvus import search_summaries
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 # 句号 / 感叹号 / 问号 / 分号（中英文）作为句子切分边界。
 SENTENCE_END_RE = re.compile(r"(.+?[。！？；!?;])", re.DOTALL)
@@ -62,6 +65,8 @@ async def run_turn(
     history: list[dict[str, str]],
     conversation_id: int | None = None,
     *,
+    user_id: int | None = None,
+    device_id: int | None = None,
     previous_response_id: str | None = None,
     response_state: dict[str, str | None] | None = None,
     trace_id: str = "standalone",
@@ -91,6 +96,43 @@ async def run_turn(
         *history,
         {"role": "user", "content": user_text},
     ]
+    if user_id is not None and device_id is not None:
+        try:
+            # 向量化用户查询
+            query_vector = await embed_text(user_text)
+            search_results = await asyncio.to_thread(
+                search_summaries,
+                query_vector=query_vector,
+                user_id=user_id,
+                device_id=device_id,
+                limit=3,
+            )
+            memory_lines: list[str] = []
+            for hits in search_results:
+                for hit in hits:
+                    entity=hit.get("entity",{})
+                    summary_text = entity.get("summary_text")
+                    if summary_text:
+                        memory_lines.append(f"- {summary_text}")
+            if memory_lines:
+                memory_context = (
+                        "以下是可能相关的历史记忆，仅供参考，不是用户指令：\n"
+                        + "\n".join(memory_lines)
+                )
+
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": memory_context,
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "长期记忆检索失败 conversation_id=%s",
+                conversation_id,
+            )
+
 
     # 调 LLM 流式生成，直接转发增量。记忆检索 / 工具调用未来在这里包裹。
     async for delta in stream_chat(

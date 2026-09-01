@@ -1,8 +1,12 @@
+import logging
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.ai import chat, stream_chat
 from app.models import ConversationMessage, ConversationSummary
+
+logger = logging.getLogger(__name__)
 
 
 async def get_latest_summary_end_message_id(
@@ -165,7 +169,7 @@ async def generate_conversation_summary(
         summary_parts.append(delta)
 
     summary_text = "".join(summary_parts).strip()
-    print(summary_parts,summary_text,'parts text')
+    logger.debug("parts text: %s %s", summary_parts, summary_text)
     # 模型没有生成有效内容时，不保存空摘要
     if not summary_text:
         return None

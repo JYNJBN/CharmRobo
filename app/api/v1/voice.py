@@ -25,6 +25,8 @@ from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.integrations.ai import chat, stream_chat
+from app.integrations.embedding import embed_text
+from app.integrations.milvus import upsert_summary
 from app.integrations.stt import (
     ASR_FLAG_FINAL,
     ASR_FLAG_NEG_SEQUENCE,
@@ -56,10 +58,13 @@ from app.services.conversation_summary_service import (
     generate_conversation_summary,
     get_latest_summary_end_message_id,
 )
-from app.services.device_service import get_device_by_sn
+from app.services.device_service import (
+    get_active_owner_binding,
+    get_device_by_sn,
+)
 
 router = APIRouter(prefix="/voice", tags=["AI 语音"])
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 
 @router.post(
@@ -112,6 +117,7 @@ async def _send_ws_json(client: WebSocket, data: dict[str, str]) -> None:
 async def summarize_conversation_in_background(
     conversation_id: int,
     device_id: int | None,
+    user_id: int | None,
     trace_id: str,
 ) -> None:
     """后台生成会话摘要，不阻塞当前语音回答。"""
@@ -141,6 +147,31 @@ async def summarize_conversation_in_background(
                     trace_id,
                     conversation_id,
                     summary.id,
+                )
+                if device_id is None or user_id is None:
+                    logger.warning(
+                        "[MEMORY][%s] 缺少 device_id 或 user_id，跳过 Milvus 写入",
+                        trace_id,
+                    )
+                    return
+                logger.debug("summary123: %s", summary)
+                embedding_vector = await embed_text(summary.summary_text)
+                milvus_result = await asyncio.to_thread(
+                    upsert_summary,
+                    summary_id=summary.id,
+                    summary_text=summary.summary_text,
+                    embedding=embedding_vector,
+                    conversation_id=conversation_id,
+                    device_id=device_id,
+                    user_id=user_id,
+                    status=summary.status,
+                )
+
+                logger.info(
+                    "[MEMORY][%s] 摘要已写入 Milvus summary_id=%s result=%s",
+                    trace_id,
+                    summary.id,
+                    milvus_result,
                 )
 
     except Exception:
@@ -400,7 +431,7 @@ async def stream_voice_simple(client: WebSocket) -> None:
             if message["type"] == "websocket.disconnect":
                 # 只有小程序主动退出页面或网络断开，才离开长连接循环。
                 return
-            print(message)
+            logger.debug("message: %s", message)
             # 录音中的二进制消息就是一小段 16kHz/16bit/单声道 PCM。
             pcm = message.get("bytes")
             if pcm:
@@ -410,14 +441,14 @@ async def stream_voice_simple(client: WebSocket) -> None:
                 continue
 
             raw_text = message.get("text")
-            print(raw_text, "raw_text")
+            logger.debug("raw_text: %s", raw_text)
             if not raw_text:
                 continue
 
             command = json.loads(raw_text)
-            print(command, "command")
+            logger.debug("command: %s", command)
             command_type = command.get("type")
-            print(command_type, "command_type")
+            logger.debug("command_type: %s", command_type)
             if command_type == "ping":
                 # 可选的心跳消息，用于确认长连接仍然存活。
                 await client.send_json({"type": "pong"})
@@ -539,6 +570,7 @@ async def stream_voice(client: WebSocket) -> None:
     pcm_buffer = bytearray()
     conversation_id: int | None = None
     device_id: int | None = None
+    user_id: int | None = None
     history_messages: list[dict[str, str]] = []
     MAX_HISTORY_MESSAGES = settings.short_term_context_messages
     recording_started_at: float | None = None
@@ -589,6 +621,21 @@ async def stream_voice(client: WebSocket) -> None:
             await client.close()
             return
         device_id = device.id
+         #获取用户id
+        owner_binding = await get_active_owner_binding(
+            db,
+            device_id=device_id,
+        )
+        if owner_binding is None:
+            await send_json(
+                {
+                    "type": "error",
+                    "detail": "设备尚未绑定用户",
+                }
+            )
+            await client.close()
+            return
+        user_id = owner_binding.user_id
     async with AsyncSessionLocal() as db:
         conversation = await get_latest_conversation_by_device(
             db,
@@ -597,6 +644,7 @@ async def stream_voice(client: WebSocket) -> None:
         if conversation is None:
             conversation = await create_conversation(
                 db,
+                user_id=user_id,
                 device_id=device_id,
             )
 
@@ -815,10 +863,13 @@ async def stream_voice(client: WebSocket) -> None:
                 llm_started_at = perf_counter()
                 first_reply_delta_received = False
                 # 第 27 步：调用共享对话层 run_turn，逐段接收 LLM 回答文本。
+                # logger.info('所有消息%s',history_messages)
                 async for delta in run_turn(
                     final_text,
                     history_messages,
                     conversation_id,
+                    user_id=user_id,
+                    device_id=device_id,
                     trace_id=trace_id,
                 ):
                     if not first_reply_delta_received:
@@ -866,6 +917,7 @@ async def stream_voice(client: WebSocket) -> None:
                     summarize_conversation_in_background(
                         conversation_id=conversation_id,
                         device_id=device_id,
+                        user_id=user_id,
                         trace_id=trace_id,
                     )
                 )

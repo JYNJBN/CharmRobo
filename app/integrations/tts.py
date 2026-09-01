@@ -23,7 +23,7 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 TTS_STREAM_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
