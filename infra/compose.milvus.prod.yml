@@ -62,4 +62,5 @@ services:
 
 networks:
   default:
-    name: milvus
+    name: charmrobo_default
+    external: true
