@@ -59,6 +59,11 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+    networks:
+      default:
+        aliases:
+          - standalone
+          - milvus-standalone
 
 networks:
   default:
