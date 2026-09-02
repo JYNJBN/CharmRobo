@@ -17,3 +17,6 @@ wheels/
 
 # 本地上传文件
 uploads/
+
+# Milvus 运行数据，不提交 Git
+infra/milvus/volumes/

@@ -2,6 +2,7 @@ from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+
 class Settings(BaseSettings):
     app_name: str="Charming Device API"
     debug: bool=True
