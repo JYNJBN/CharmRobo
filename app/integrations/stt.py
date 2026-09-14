@@ -106,9 +106,7 @@ def build_asr_config_frame() -> bytes:
             "force_to_speech_time": 800,
         },
     }
-    compressed = gzip.compress(
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    )
+    compressed = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     return (
         build_asr_header(ASR_MSG_FULL_CLIENT, ASR_FLAG_NO_SEQUENCE, 1, 1)
         + struct.pack(">I", len(compressed))
@@ -180,9 +178,7 @@ def extract_stream_text(data: dict[str, Any]) -> str:
     utterances = result.get("utterances") or []
     if isinstance(utterances, list):
         return "".join(
-            str(item.get("text") or "")
-            for item in utterances
-            if isinstance(item, dict)
+            str(item.get("text") or "") for item in utterances if isinstance(item, dict)
         ).strip()
     return ""
 
@@ -326,8 +322,7 @@ async def transcribe_wav(
 
     # 火山服务会从这个 URL 下载音频，因此不能填写 localhost 或 127.0.0.1。
     audio_url = (
-        f"{settings.public_base_url.rstrip('/')}/static/"
-        f"{relative_path.as_posix()}"
+        f"{settings.public_base_url.rstrip('/')}/static/{relative_path.as_posix()}"
     )
     payload = {
         "audio": {

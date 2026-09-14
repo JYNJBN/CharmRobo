@@ -1,7 +1,8 @@
 import logging
 
+from fastapi import HTTPException, status
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,20 +12,21 @@ from app.core.device_security import (
 )
 from app.models import Device, UserDevice
 from app.schemas.device import BootstrapDeviceRequest, UserDeviceResponse
+from app.schemas.user import UpdateDeviceModelResponse
+from app.services.agent_service import ensure_default_agent_on_device
 from app.services.device_binding_service import (
     delete_bind_ticket,
     get_bind_ticket,
 )
+from app.services.model_service import MODEL_REGISTRY
 from app.utils.tools import local_now
 
 logger = logging.getLogger(__name__)
 
 
-
-
 async def get_device_by_sn(
-    db: AsyncSession,
-    device_sn: str,
+        db: AsyncSession,
+        device_sn: str,
 ) -> Device | None:
     """根据 SN 查询尚未逻辑删除的设备。"""
 
@@ -38,8 +40,8 @@ async def get_device_by_sn(
 
 
 async def get_active_owner_binding(
-    db: AsyncSession,
-    device_id: int,
+        db: AsyncSession,
+        device_id: int,
 ) -> UserDevice | None:
     """查询设备当前有效的拥有者绑定关系。"""
 
@@ -54,9 +56,9 @@ async def get_active_owner_binding(
 
 
 async def get_user_device_binding(
-    db: AsyncSession,
-    user_id: int,
-    device_id: int,
+        db: AsyncSession,
+        user_id: int,
+        device_id: int,
 ) -> UserDevice | None:
     """查询某个用户和设备的关系，包括已逻辑删除的记录。"""
 
@@ -70,9 +72,9 @@ async def get_user_device_binding(
 
 
 async def bootstrap_device(
-    db: AsyncSession,
-    redis: Redis,
-    data: BootstrapDeviceRequest,
+        db: AsyncSession,
+        redis: Redis,
+        data: BootstrapDeviceRequest,
 ) -> Device:
     """
     使用硬件生成的永久密钥初始化并绑定设备。
@@ -118,8 +120,8 @@ async def bootstrap_device(
     # ================================================================
     if existing_device is not None and existing_device.device_secret_hash:
         if not verify_device_secret(
-            data.device_secret,
-            existing_device.device_secret_hash,
+                data.device_secret,
+                existing_device.device_secret_hash,
         ):
             # 路线 5：SN 已存在，但密钥错误。
             logger.warning(
@@ -336,6 +338,11 @@ async def bootstrap_device(
                 binding.id,
             )
 
+        # 绑定完成后，在同一事务内物化默认智能体副本并激活
+        # （实施手册 3-Step5）。ensure 内部只 flush 不 commit，
+        # 失败时走外层 except 整体回滚，设备与副本同生共死。
+        await ensure_default_agent_on_device(db=db, device=device)
+
         # device 和 user_device 在同一 MySQL 事务中提交。
         await db.commit()
         await db.refresh(device)
@@ -383,12 +390,12 @@ async def bootstrap_device(
         # 两个相同请求并发时，其中一个可能已经创建成功。
         concurrent_device = await get_device_by_sn(db, data.device_sn)
         if (
-            concurrent_device is not None
-            and concurrent_device.device_secret_hash
-            and verify_device_secret(
-                data.device_secret,
-                concurrent_device.device_secret_hash,
-            )
+                concurrent_device is not None
+                and concurrent_device.device_secret_hash
+                and verify_device_secret(
+            data.device_secret,
+            concurrent_device.device_secret_hash,
+        )
         ):
             concurrent_owner = await get_active_owner_binding(
                 db,
@@ -418,8 +425,8 @@ async def bootstrap_device(
 
 
 async def get_devices_by_user_id(
-    db: AsyncSession,
-    user_id: int,
+        db: AsyncSession,
+        user_id: int,
 ) -> list[UserDeviceResponse]:
     """
     查询当前用户绑定的全部有效设备。
@@ -434,6 +441,7 @@ async def get_devices_by_user_id(
             Device.device_sn,
             Device.product_key,
             Device.firmware_version,
+            Device.model_key,
             Device.hardware_version,
             Device.status,
             Device.last_online_time,
@@ -474,9 +482,9 @@ async def get_devices_by_user_id(
 
 
 async def unbind_device_for_user(
-    db: AsyncSession,
-    user_id: int,
-    device_id: int,
+        db: AsyncSession,
+        user_id: int,
+        device_id: int,
 ) -> None:
     """
     解除当前用户和指定设备的绑定关系。
@@ -527,3 +535,35 @@ async def unbind_device_for_user(
             device_id,
         )
         raise
+
+
+async def update_device_model_for_user(
+        db: AsyncSession, user_id: int, device_id: int, model_key: str
+) -> UpdateDeviceModelResponse:
+    """ "更新设备的大语言模型"""
+    #     判断设备是否属于当前用户
+    binding = await get_user_device_binding(db, user_id, device_id)
+    if binding is None or binding.deleted != 0:
+        logger.warning("设备不存在或未绑定")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="设备不存在或未绑定")
+    # 第一版
+    if binding.role != "owner":
+        logger.warning("只有设备拥有者可以切换模型")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有设备拥有者可以切换模型")
+    # 校验模型是否在后端允许列表内 todo
+    if model_key not in MODEL_REGISTRY:
+        logger.warning("模型不存在")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="模型不存在")
+    result = await db.execute(
+        update(Device)
+        .where(Device.id == device_id, Device.deleted == 0)
+        .values(model_key=model_key)
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        logger.warning("设备不存在%s", device_id)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="设备不存在")
+    await db.commit()
+
+    # 响应模型的字段叫 model，不叫 model_key（别和请求模型搞混）
+    return UpdateDeviceModelResponse(device_id=device_id, model_key=model_key)

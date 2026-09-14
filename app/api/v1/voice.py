@@ -47,12 +47,11 @@ from app.schemas.voice import (
     VoiceChatRequest,
     VoiceChatResponse,
 )
+from app.services.agent_service import ensure_default_agent_on_device, get_active_agent_for_device
 from app.services.conversation import SentenceSplitter, run_turn
 from app.services.conversation_service import (
     add_conversation_message,
-    create_conversation,
-    get_latest_conversation_by_device,
-    get_recent_messages,
+    get_recent_messages, get_or_create_conversation,
 )
 from app.services.conversation_summary_service import (
     generate_conversation_summary,
@@ -62,6 +61,8 @@ from app.services.device_service import (
     get_active_owner_binding,
     get_device_by_sn,
 )
+from app.services.model_service import describe_model, resolve_model
+from app.services.voice_service import resolve_voice_id
 
 router = APIRouter(prefix="/voice", tags=["AI 语音"])
 logger = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ logger = logging.getLogger(__name__)
     response_model=ApiResponse[VoiceChatResponse],
 )
 async def voice_chat_api(
-    data: VoiceChatRequest,
+        data: VoiceChatRequest,
 ) -> ApiResponse[VoiceChatResponse]:
     """文字聊天接口，先采用非流式返回，方便小程序验证链路。"""
 
@@ -114,27 +115,29 @@ async def _send_ws_json(client: WebSocket, data: dict[str, str]) -> None:
         await client.send_json(data)
     except (RuntimeError, WebSocketDisconnect):
         pass
+
+
 async def summarize_conversation_in_background(
-    conversation_id: int,
-    device_id: int | None,
-    user_id: int | None,
-    trace_id: str,
+        conversation_id: int,
+        device_id: int | None,
+        user_id: int | None,
+        trace_id: str,
+        agent_id: int | None = None,
 ) -> None:
     """后台生成会话摘要，不阻塞当前语音回答。"""
 
     try:
         async with AsyncSessionLocal() as db:
-            last_covered_message_id = (
-                await get_latest_summary_end_message_id(
-                    db,
-                    conversation_id=conversation_id,
-                )
+            last_covered_message_id = await get_latest_summary_end_message_id(
+                db,
+                conversation_id=conversation_id,
             )
 
             summary = await generate_conversation_summary(
                 db,
                 conversation_id=conversation_id,
                 device_id=device_id,
+                agent_id=agent_id,
                 last_covered_message_id=last_covered_message_id,
                 limit=settings.summary_batch_messages,
                 trace_id=f"{trace_id}-summary",
@@ -142,19 +145,17 @@ async def summarize_conversation_in_background(
 
             if summary is not None:
                 logger.info(
-                    "[SUMMARY][%s] 摘要生成成功 "
-                    "conversation_id=%s summary_id=%s",
+                    "[SUMMARY][%s] 摘要生成成功 conversation_id=%s summary_id=%s",
                     trace_id,
                     conversation_id,
                     summary.id,
                 )
-                if device_id is None or user_id is None:
+                if device_id is None or user_id is None or agent_id is None:
                     logger.warning(
-                        "[MEMORY][%s] 缺少 device_id 或 user_id，跳过 Milvus 写入",
+                        "[MEMORY][%s] 缺少 device_id/user_id/agent_id，跳过 Milvus 写入",
                         trace_id,
                     )
                     return
-                logger.debug("summary123: %s", summary)
                 embedding_vector = await embed_text(summary.summary_text)
                 milvus_result = await asyncio.to_thread(
                     upsert_summary,
@@ -164,6 +165,7 @@ async def summarize_conversation_in_background(
                     conversation_id=conversation_id,
                     device_id=device_id,
                     user_id=user_id,
+                    agent_id=agent_id,
                     status=summary.status,
                 )
 
@@ -180,6 +182,7 @@ async def summarize_conversation_in_background(
             trace_id,
             conversation_id,
         )
+
 
 @router.websocket("/tts-stream")
 async def tts_stream(client: WebSocket) -> None:
@@ -211,9 +214,9 @@ async def tts_stream(client: WebSocket) -> None:
         # 这里的 async for 是“收到一块就发送一块”，不会等待全部音频合成完。
         trace_id = uuid.uuid4().hex[:8]
         async for pcm_chunk in stream_speech_pcm(
-            request.text,
-            request.voice,
-            trace_id=trace_id,
+                request.text,
+                request.voice,
+                trace_id=trace_id,
         ):
             await client.send_bytes(pcm_chunk)
 
@@ -249,10 +252,10 @@ async def stream_voice_realtime(client: WebSocket) -> None:
     try:
         # 旧版流式 ASR：FastAPI 再连接火山的流式 ASR WebSocket。
         async with websockets.connect(
-            ASR_STREAM_URL,
-            additional_headers=stream_asr_headers(),
-            open_timeout=15,
-            close_timeout=5,
+                ASR_STREAM_URL,
+                additional_headers=stream_asr_headers(),
+                open_timeout=15,
+                close_timeout=5,
         ) as volc_ws:
             # 先发送一次音频配置，告诉火山后面收到的是 16kHz PCM。
             await volc_ws.send(build_asr_config_frame())
@@ -349,7 +352,7 @@ async def stream_voice_realtime(client: WebSocket) -> None:
                             if not match:
                                 break
                             sentence = match.group(1).strip()
-                            sentence_buffer = sentence_buffer[match.end() :]
+                            sentence_buffer = sentence_buffer[match.end():]
 
                             # 发送给小程序，进入 TTS 队列
                             if sentence:
@@ -569,6 +572,9 @@ async def stream_voice(client: WebSocket) -> None:
     is_recording = False
     pcm_buffer = bytearray()
     conversation_id: int | None = None
+    agent_id: int | None = None
+    agent_name: str | None = None
+    agent_system_prompt: str | None = None
     device_id: int | None = None
     user_id: int | None = None
     history_messages: list[dict[str, str]] = []
@@ -620,12 +626,22 @@ async def stream_voice(client: WebSocket) -> None:
             )
             await client.close()
             return
+
         device_id = device.id
-         #获取用户id
+        # 获取用户id
         owner_binding = await get_active_owner_binding(
             db,
             device_id=device_id,
         )
+        # 老设备兜底：激活指针为空或失效时，物化默认智能体副本（手册 6-Step1）。
+        agent = await ensure_default_agent_on_device(db=db, device=device)
+        if agent is None:
+            await send_json({"type": "error", "detail": "设备没有可用智能体"})
+            await client.close()
+            return
+        # ensure 内部只 flush 不 commit，物化结果在这里统一提交。
+        await db.commit()
+
         if owner_binding is None:
             await send_json(
                 {
@@ -636,20 +652,21 @@ async def stream_voice(client: WebSocket) -> None:
             await client.close()
             return
         user_id = owner_binding.user_id
+        # agent配置
+        agent_id = agent.id
+        agent_name = agent.name
+        agent_system_prompt = agent.system_prompt
+        model_config = resolve_model(agent.model_key)
+        model_label = describe_model(agent.model_key)
+        voice_id = resolve_voice_id(agent.voice)
     async with AsyncSessionLocal() as db:
-        conversation = await get_latest_conversation_by_device(
+        conversation = await get_or_create_conversation(
             db,
+            user_id=user_id,
             device_id=device_id,
+            agent_id=agent_id,
         )
-        if conversation is None:
-            conversation = await create_conversation(
-                db,
-                user_id=user_id,
-                device_id=device_id,
-            )
-
         conversation_id = conversation.id
-
         history_messages = await get_recent_messages(
             db,
             conversation_id=conversation_id,
@@ -781,6 +798,50 @@ async def stream_voice(client: WebSocket) -> None:
                 await send_json({"type": "final", "text": final_text})
                 await send_json({"type": "reply_start", "text": final_text})
 
+                # 每轮重新读一次设备当前配置的模型：
+                # 长连接建连时只算一次的话，中途在小程序里切换模型不会生效，
+                # 必须等重连才变化。这里按轮刷新，切完立刻生效。
+                try:
+                    async with AsyncSessionLocal() as db:
+                        fresh_device = await get_device_by_sn(db, device_sn)
+                        if fresh_device is not None:
+                            fresh_agent = await get_active_agent_for_device(db, fresh_device)
+                            model_config = resolve_model(fresh_agent.model_key)
+                            model_label = describe_model(fresh_agent.model_key)
+                            voice_id = resolve_voice_id(fresh_agent.voice)
+                            agent_name = fresh_agent.name
+                            agent_system_prompt = fresh_agent.system_prompt
+                            device_id = fresh_device.id
+                            # 智能体被切换了：会话和历史跟着切到新智能体名
+                            if fresh_agent.id != agent_id:
+                                agent_id = fresh_agent.id
+                                conversation = await get_or_create_conversation(
+                                    db,
+                                    user_id=user_id,
+                                    device_id=device_id,
+                                    agent_id=agent_id,
+                                )
+                                conversation_id = conversation.id
+                                history_messages = await get_recent_messages(
+                                    db,
+                                    conversation_id=conversation_id,
+                                    limit=MAX_HISTORY_MESSAGES,
+                                )
+                except ValueError as exc:
+                    # 例如切到一个 MODEL_REGISTRY 里没有、或 .env 未配置模型 id 的 key：
+                    # 保持上一轮的模型继续服务，不要把整轮对话打断。
+                    logger.warning(
+                        "[VOICE][%s] 模型解析失败，沿用上一轮模型: %s",
+                        trace_id,
+                        exc,
+                    )
+                logger.info(
+                    "[VOICE][%s] 本轮使用模型 label=%s model=%s",
+                    trace_id,
+                    model_label,
+                    model_config["model_id"],
+                )
+
                 # TTS worker 与 LLM 生成并行：LLM 继续产出文字，worker 负责合成已经完成的句子。
                 # 创建 TTS 队列和计时状态，用于异步处理已完成的句子。
                 tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -792,10 +853,11 @@ async def stream_voice(client: WebSocket) -> None:
                 }
 
                 async def tts_worker(
-                    queue: asyncio.Queue[str | None] = tts_queue,
-                    state: dict[str, float | int | None] = timing_state,
-                    current_trace_id: str = trace_id,
-                    current_round_started_at: float = round_started_at,
+                        queue: asyncio.Queue[str | None] = tts_queue,
+                        state: dict[str, float | int | None] = timing_state,
+                        current_trace_id: str = trace_id,
+                        current_voice_id: str = voice_id,
+                        current_round_started_at: float = round_started_at,
                 ) -> None:
                     """按顺序消费句子，并把 TTS PCM 复用主 WebSocket 发给小程序。"""
 
@@ -829,10 +891,10 @@ async def stream_voice(client: WebSocket) -> None:
 
                             # stream_speech_pcm 是 FastAPI 到火山 TTS 的内部连接，逐片返回 PCM 后经主 WebSocket 转发给小程序。
                             async for pcm_chunk in stream_speech_pcm(
-                                sentence,
-                                "zh_female_vv_uranus_bigtts",
-                                trace_id=current_trace_id,
-                                sentence_no=sentence_no,
+                                    sentence,
+                                    current_voice_id,
+                                    trace_id=current_trace_id,
+                                    sentence_no=sentence_no,
                             ):
                                 if state["first_tts_audio_at"] is None:
                                     first_tts_audio_at = perf_counter()
@@ -863,12 +925,18 @@ async def stream_voice(client: WebSocket) -> None:
                 # 调用共享对话层 run_turn，逐段接收 LLM 回答文本。
                 # logger.info('所有消息%s',history_messages)
                 async for delta in run_turn(
-                    final_text,
-                    history_messages,
-                    conversation_id,
-                    user_id=user_id,
-                    device_id=device_id,
-                    trace_id=trace_id,
+                        final_text,
+                        history_messages,
+                        conversation_id,
+                        user_id=user_id,
+                        device_id=device_id,
+                        trace_id=trace_id,
+                        agent_id=agent_id,
+                        agent_name=agent_name,
+                        agent_system_prompt=agent_system_prompt,
+                        model=model_config,
+                        # 每轮刷新的模型名（豆包/DeepSeek），注入系统提示词用
+                        model_label=model_label
                 ):
                     if not first_reply_delta_received:
                         first_reply_delta_received = True
@@ -915,6 +983,7 @@ async def stream_voice(client: WebSocket) -> None:
                     summarize_conversation_in_background(
                         conversation_id=conversation_id,
                         device_id=device_id,
+                        agent_id=agent_id,
                         user_id=user_id,
                         trace_id=trace_id,
                     )
@@ -947,14 +1016,15 @@ async def stream_voice(client: WebSocket) -> None:
                 # 等所有句子的 TTS 都发送完成，再结束本轮。
                 # 向 worker 发送结束标记，并等待所有 TTS 队列任务完成。
                 await tts_queue.put(None)
-                await tts_queue.join()
+                # await tts_queue.join()
+                # await tts_task 等的是worker这个协程本身结束
                 await tts_task
                 # 记录 TTS 阶段和整轮语音交互的耗时。
                 tts_worker_started_at = timing_state["tts_worker_started_at"]
                 tts_active_started_at = timing_state["tts_active_started_at"]
                 if isinstance(tts_worker_started_at, float) and isinstance(
-                    tts_active_started_at,
-                    float,
+                        tts_active_started_at,
+                        float,
                 ):
                     logger.info(
                         "[VOICE-TIMING][%s][PIPELINE] 全部 TTS 阶段结束 "

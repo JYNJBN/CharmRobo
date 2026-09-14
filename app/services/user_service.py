@@ -35,9 +35,7 @@ async def create_user(
     logger.debug("Pydantic 数据：%s", data)
     logger.debug("转换后的字典：%s", data.model_dump())
     # openid 是微信用户唯一标识，创建前先检查是否重复。
-    result = await db.execute(
-        select(User).where(User.openid == data.openid)
-    )
+    result = await db.execute(select(User).where(User.openid == data.openid))
     if result.scalar_one_or_none() is not None:
         raise ValueError("openid 已经存在")
     logger.debug("data: %s", data)
@@ -69,8 +67,10 @@ async def update_user(
     await db.commit()
     await db.refresh(user)
     return user
+
+
 # 获取openid + session_key
-async def get_wechat_session(code:str)->dict[str, str]:
+async def get_wechat_session(code: str) -> dict[str, str]:
     url = "https://api.weixin.qq.com/sns/jscode2session"
     params = {
         "appid": settings.wechat_app_id,
@@ -83,29 +83,30 @@ async def get_wechat_session(code:str)->dict[str, str]:
         response.raise_for_status()
         return response.json()
 
-async def login_service(db:AsyncSession,code:str) -> LoginResponse | None:
+
+async def login_service(db: AsyncSession, code: str) -> LoginResponse | None:
     """
-      微信小程序登录流程：
-      1. 前端 wx.login() 拿到 code
-      2. 后端用 code 换 openid + session_key
-      3. 根据 openid 查/建用户
-      4. 生成 JWT 返回前端
-     """
+    微信小程序登录流程：
+    1. 前端 wx.login() 拿到 code
+    2. 后端用 code 换 openid + session_key
+    3. 根据 openid 查/建用户
+    4. 生成 JWT 返回前端
+    """
     session = await get_wechat_session(code)
     logger.debug("session: %s", session)
-    openid = session.get('openid')
+    openid = session.get("openid")
     # session_key = session.get('session_key')  # 安全取，key 不存在返回 None，不抛错
     logger.debug("openid: %s", openid)
     if not openid:
         error_message = session.get("errmsg", "微信登录失败")
         raise ValueError(error_message)
-    result=await db.execute(
+    result = await db.execute(
         select(User).where(User.openid == openid, User.deleted == 0)
     )
     user = result.scalar_one_or_none()
     # 数据库没有这个用户创建用户
     if user is None:
-        user = User(openid=openid,nickname=f'用户{openid[-5:]}')
+        user = User(openid=openid, nickname=f"用户{openid[-5:]}")
         db.add(user)
         await db.commit()
         await db.refresh(user)
@@ -117,7 +118,7 @@ async def login_service(db:AsyncSession,code:str) -> LoginResponse | None:
         access_token=access_token,
         expires_in=expires_in,
         token_type="bearer",
-        user=user_response
+        user=user_response,
     )
 
 

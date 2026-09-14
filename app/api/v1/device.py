@@ -13,11 +13,13 @@ from app.schemas.device import (
     CreateTicketResponse,
     UserDeviceResponse,
 )
+from app.schemas.user import UpdateDeviceModelResponse, UpdateDeviceModelRequest
 from app.services.device_binding_service import create_bind_ticket
 from app.services.device_service import (
     bootstrap_device,
     get_devices_by_user_id,
     unbind_device_for_user,
+    update_device_model_for_user,
 )
 
 # 小程序调用的接口，需要用户 JWT。
@@ -25,7 +27,6 @@ user_device_router = APIRouter(
     prefix="/device",
     tags=["用户设备"],
 )
-
 
 # 硬件调用的接口，不使用用户 JWT。
 hardware_device_router = APIRouter(
@@ -39,9 +40,9 @@ hardware_device_router = APIRouter(
     response_model=ApiResponse[CreateTicketResponse],
 )
 async def create_ticket_api(
-    data: CreateTicketRequest,
-    redis: RedisClient,
-    current_user_id: CurrentUserId,
+        data: CreateTicketRequest,
+        redis: RedisClient,
+        current_user_id: CurrentUserId,
 ) -> ApiResponse[CreateTicketResponse]:
     """
     小程序申请一次性绑定码。
@@ -66,9 +67,9 @@ async def create_ticket_api(
     response_model=ApiResponse[BootstrapDeviceResponse],
 )
 async def bootstrap_device_api(
-    data: BootstrapDeviceRequest,
-    db: DbSession,
-    redis: RedisClient,
+        data: BootstrapDeviceRequest,
+        db: DbSession,
+        redis: RedisClient,
 ) -> ApiResponse[BootstrapDeviceResponse]:
     """
     硬件第一次初始化。
@@ -98,13 +99,14 @@ async def bootstrap_device_api(
         )
     )
 
+
 @user_device_router.get(
     "",
     response_model=ApiResponse[list[UserDeviceResponse]],
 )
 async def get_my_devices_api(
-    db: DbSession,
-    current_user_id: CurrentUserId,
+        db: DbSession,
+        current_user_id: CurrentUserId,
 ) -> ApiResponse[list[UserDeviceResponse]]:
     """
     查询当前登录用户绑定的设备。
@@ -125,9 +127,9 @@ async def get_my_devices_api(
     response_model=ApiResponse[None],
 )
 async def unbind_device_api(
-    device_id: int,
-    db: DbSession,
-    current_user_id: CurrentUserId,
+        device_id: int,
+        db: DbSession,
+        current_user_id: CurrentUserId,
 ) -> ApiResponse[None]:
     """解除当前用户和设备的绑定，不删除硬件设备记录。"""
 
@@ -144,3 +146,18 @@ async def unbind_device_api(
         ) from exc
 
     return ApiResponse(message="设备已移除", data=None)
+
+
+@user_device_router.patch(
+    "/{device_id}/model",
+    response_model=ApiResponse[UpdateDeviceModelResponse],
+)
+async def patch_device_model(
+        db: DbSession,
+        device_id: int,
+        data: UpdateDeviceModelRequest,
+        current_user_id: CurrentUserId,
+) -> ApiResponse[UpdateDeviceModelResponse]:
+    result = await update_device_model_for_user(
+        db=db, user_id=current_user_id, device_id=device_id, model_key=data.model_key)
+    return ApiResponse(data=result)

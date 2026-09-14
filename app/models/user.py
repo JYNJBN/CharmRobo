@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 
 from sqlalchemy import BigInteger, Date, DateTime, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -6,15 +6,17 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 """用户表"""
+
+
 class User(Base):
     __tablename__ = "user"
-    id:Mapped[int]=mapped_column(
+    id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         autoincrement=True,
     )
     # 微信用户唯一标识
-    openid:Mapped[str]=mapped_column(
+    openid: Mapped[str] = mapped_column(
         String(64),
         unique=True,
         index=True,
@@ -43,7 +45,7 @@ class User(Base):
         nullable=False,
     )
 
-    birthday: Mapped[datetime | None] = mapped_column(
+    birthday: Mapped[date | None] = mapped_column(
         Date,
         nullable=True,
     )

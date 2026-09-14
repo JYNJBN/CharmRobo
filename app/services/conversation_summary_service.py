@@ -3,15 +3,15 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.integrations.ai import chat, stream_chat
+from app.integrations.ai import stream_chat
 from app.models import ConversationMessage, ConversationSummary
 
 logger = logging.getLogger(__name__)
 
 
 async def get_latest_summary_end_message_id(
-    db: AsyncSession,
-    conversation_id: int,
+        db: AsyncSession,
+        conversation_id: int,
 ) -> int:
     """查询当前会话已经摘要到哪一条消息。"""
     stmt = (
@@ -29,10 +29,10 @@ async def get_latest_summary_end_message_id(
 
 
 async def get_uncovered_messages(
-    db: AsyncSession,
-    conversation_id: int,
-    last_covered_message_id: int = 0,
-    limit: int = 20,
+        db: AsyncSession,
+        conversation_id: int,
+        last_covered_message_id: int = 0,
+        limit: int = 20,
 ) -> list[dict[str, object]]:
     """获取还没有被摘要覆盖的消息。"""
     result = await db.execute(
@@ -59,19 +59,21 @@ async def get_uncovered_messages(
 
 
 async def create_conversation_summary(
-    db: AsyncSession,
-    conversation_id: int,
-    device_id: int,
-    summary_text: str,
-    covered_start_message_id: int,
-    covered_end_message_id: int,
-    summary_level: str = "segment",
+        db: AsyncSession,
+        conversation_id: int,
+        device_id: int,
+        summary_text: str,
+        covered_start_message_id: int,
+        covered_end_message_id: int,
+        agent_id: int | None = None,
+        summary_level: str = "segment",
 ) -> ConversationSummary:
     """创建一条会话摘要"""
     summary = ConversationSummary(
         conversation_id=conversation_id,
         device_id=device_id,
         summary_text=summary_text,
+        agent_id=agent_id,
         covered_start_message_id=covered_start_message_id,
         covered_end_message_id=covered_end_message_id,
         summary_level=summary_level,
@@ -84,9 +86,9 @@ async def create_conversation_summary(
 
 
 async def get_recent_summaries(
-    db: AsyncSession,
-    conversation_id: int,
-    limit: int = 5,
+        db: AsyncSession,
+        conversation_id: int,
+        limit: int = 5,
 ) -> list[dict[str, object]]:
     """获取最近几条摘要，按时间正序返回。"""
     stmt = (
@@ -117,12 +119,13 @@ async def get_recent_summaries(
 
 
 async def generate_conversation_summary(
-    db: AsyncSession,
-    conversation_id: int,
-    device_id: int | None,
-    last_covered_message_id: int,
-    limit: int = 20,
-    trace_id: str = "summary",
+        db: AsyncSession,
+        conversation_id: int,
+        device_id: int | None,
+        last_covered_message_id: int,
+        limit: int = 20,
+        trace_id: str = "summary",
+        agent_id: int | None = None,
 ) -> ConversationSummary | None:
     """生成一批未摘要消息的摘要。"""
 
@@ -141,9 +144,7 @@ async def generate_conversation_summary(
     lines: list[str] = []
 
     for message in messages:
-        lines.append(
-            f"{message['role']}: {message['content']}"
-        )
+        lines.append(f"{message['role']}: {message['content']}")
 
     raw_text = "\n".join(lines)
 
@@ -158,13 +159,13 @@ async def generate_conversation_summary(
     summary_parts: list[str] = []
 
     async for delta in stream_chat(
-        text=summary_prompt,
-        trace_id=trace_id,
-        instructions=(
-            "你是对话摘要器。"
-            "你只负责生成准确、简洁、可用于长期记忆检索的中文摘要。"
-            "不要回答用户问题，不要编造对话中没有的信息。"
-        ),
+            text=summary_prompt,
+            trace_id=trace_id,
+            instructions=(
+                    "你是对话摘要器。"
+                    "你只负责生成准确、简洁、可用于长期记忆检索的中文摘要。"
+                    "不要回答用户问题，不要编造对话中没有的信息。"
+            ),
     ):
         summary_parts.append(delta)
 
@@ -178,6 +179,7 @@ async def generate_conversation_summary(
         db=db,
         conversation_id=conversation_id,
         device_id=device_id,
+        agent_id=agent_id,
         summary_text=summary_text,
         covered_start_message_id=int(messages[0]["id"]),
         covered_end_message_id=int(messages[-1]["id"]),

@@ -8,12 +8,17 @@ OUTPUT_FIELDS = [
     "conversation_id",
     "device_id",
     "user_id",
+    "agent_id",
     "status",
 ]
+
+
 def get_milvus_client() -> MilvusClient:
     return MilvusClient(
         uri=settings.milvus_uri,
     )
+
+
 def upsert_summary(
         summary_id: int,
         summary_text: str,
@@ -21,8 +26,9 @@ def upsert_summary(
         conversation_id: int,
         device_id: int,
         user_id: int,
+        agent_id: int,
         status: str = "active",
-)->dict:
+) -> dict:
     if len(embedding) != settings.embedding_dimension:
         raise ValueError(
             f"向量维度不匹配：实际 {len(embedding)}，"
@@ -33,21 +39,24 @@ def upsert_summary(
         collection_name=settings.milvus_summary_collection,
         data=[
             {
-            "summary_id": summary_id,
-            "summary_text": summary_text,
-            "embedding": embedding,
-            "conversation_id": conversation_id,
-            "device_id": device_id,
-            "user_id": user_id,
-            "status": status,
-        }
-        ]
+                "summary_id": summary_id,
+                "summary_text": summary_text,
+                "embedding": embedding,
+                "conversation_id": conversation_id,
+                "device_id": device_id,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "status": status,
+            }
+        ],
     )
+
+
 def search_summaries(
-    query_vector: list[float],
-    user_id: int,
-    device_id: int,
-    limit: int = 5,
+        query_vector: list[float],
+        user_id: int,
+        agent_id: int,
+        limit: int = 5,
 ) -> list:
     if len(query_vector) != settings.embedding_dimension:
         raise ValueError(
@@ -55,10 +64,9 @@ def search_summaries(
             f"配置 {settings.embedding_dimension}"
         )
     client = get_milvus_client()
-    filter_expression=(
-        f"user_id == {user_id} "
-        f"and device_id == {device_id} "
-        f'and status == "active"'
+    # 每个设备的agent是独立的
+    filter_expression = (
+        f'user_id == {user_id} and agent_id  == {agent_id} and status == "active"'
     )
     return client.search(
         collection_name=settings.milvus_summary_collection,

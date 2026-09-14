@@ -44,11 +44,10 @@ class UserResponse(BaseModel):
     # 允许 Pydantic 直接从 SQLAlchemy User 对象读取属性。
     model_config = ConfigDict(from_attributes=True)
 
+
 class LoginRequest(BaseModel):
-    code:str = Field(
-        ...,
-        min_length=8,
-        description="微信登录code必传为，为null其他登录方式"
+    code: str = Field(
+        ..., min_length=8, description="微信登录code必传为，为null其他登录方式"
     )
 
 
@@ -69,15 +68,30 @@ class PhoneLoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     """登录接口返回值"""
-    token_type:str= "bearer"
+
+    token_type: str = "bearer"
     access_token: str | None
     expires_in: int
     user: UserResponse
+
     # 打印方法
     def __repr__(self) -> dict[str, str | None | int]:
         return {
-            'token_type': self.token_type,
-            'access_token': self.access_token,
-            'expires_in': self.expires_in,
-            'user': self.user.nickname,
+            "token_type": self.token_type,
+            "access_token": self.access_token,
+            "expires_in": self.expires_in,
+            "user": self.user.nickname,
         }
+
+
+class UpdateDeviceModelRequest(BaseModel):
+    model_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="火山方舟模型 ID 或 Endpoint ID",
+    )
+
+
+class UpdateDeviceModelResponse(BaseModel):
+    device_id: int
+    model_key: str

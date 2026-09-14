@@ -1,14 +1,14 @@
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
     DateTime,
-    ForeignKey,
     Integer,
     String,
     Text,
     func,
-    text,
+    text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,16 +19,24 @@ class Conversation(Base):
     """硬件设备与用户的一次连续对话会话。"""
 
     __tablename__ = "conversation"
-    __table_args__ = {
-        "comment": "AI 对话会话表",
-    }
-
+    __table_args__ = (
+        # 联合唯一索引
+        UniqueConstraint("agent_id", "session_id", name="uq_conversation_agent_session"),
+        {"comment": "Ai对话表"}
+    )
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         autoincrement=True,
         comment="会话主键 ID",
     )
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),  # 新行自动生成 UUID
+        comment="对外会话 ID（UUID）；预留扩展口，老数据迁移时也填 UUID",
+    )
+
     user_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
@@ -41,7 +49,11 @@ class Conversation(Base):
         index=True,
         comment="发起对话的设备 ID；设备认证完成前可为空",
     )
-
+    agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        index=True,
+        comment="agent id"
+    )
     title: Mapped[str | None] = mapped_column(
         String(100),
         nullable=True,

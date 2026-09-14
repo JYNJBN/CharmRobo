@@ -26,6 +26,7 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False,
 )
 
+
 # 得到一个数据库会话。
 async def get_db():
     async with AsyncSessionLocal() as session:

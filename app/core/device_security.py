@@ -34,4 +34,4 @@ def verify_device_secret(
     :return:boolean
     """
     actual_hash = hash_device_secret(device_secret)
-    return  hmac.compare_digest(expected_hash, actual_hash)
+    return hmac.compare_digest(expected_hash, actual_hash)

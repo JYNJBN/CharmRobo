@@ -72,6 +72,8 @@ class UserDeviceResponse(BaseModel):
     device_id: int
     device_sn: str
     product_key: str
+    # 可空：旧设备可能没有 model_key，非空声明会让整条设备列表 500
+    model_key: str | None
     firmware_version: str | None
     hardware_version: str | None
     status: int

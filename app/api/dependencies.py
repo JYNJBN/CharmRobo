@@ -20,6 +20,7 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 # redis
 RedisClient = Annotated[Redis, Depends(get_redis)]
 
+
 async def get_current_user_id(
     credentials: Annotated[
         HTTPAuthorizationCredentials | None,

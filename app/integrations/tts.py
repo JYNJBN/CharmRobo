@@ -107,12 +107,15 @@ async def synthesize_speech(
     started_at = perf_counter()
     first_chunk_received = False
     try:
-        async with httpx.AsyncClient(timeout=90) as client, client.stream(
-            "POST",
-            TTS_URL,
-            headers=headers,
-            json=payload,
-        ) as response:
+        async with (
+            httpx.AsyncClient(timeout=90) as client,
+            client.stream(
+                "POST",
+                TTS_URL,
+                headers=headers,
+                json=payload,
+            ) as response,
+        ):
             if response.status_code != 200:
                 body = await response.aread()
                 log_id = response.headers.get("X-Tt-Logid", "")
@@ -129,8 +132,7 @@ async def synthesize_speech(
                 if not first_chunk_received:
                     first_chunk_received = True
                     logger.info(
-                        "[VOICE-TIMING][%s][TTS-HTTP] 收到首个响应块 "
-                        "ttfb=%.3fs",
+                        "[VOICE-TIMING][%s][TTS-HTTP] 收到首个响应块 ttfb=%.3fs",
                         trace_id,
                         perf_counter() - started_at,
                     )
@@ -298,8 +300,7 @@ async def stream_speech_pcm(
             close_timeout=5,
         ) as tts_ws:
             logger.info(
-                "[VOICE-TIMING][%s][TTS#%d] 火山 WebSocket 已连接 "
-                "elapsed=%.3fs",
+                "[VOICE-TIMING][%s][TTS#%d] 火山 WebSocket 已连接 elapsed=%.3fs",
                 trace_id,
                 sentence_label,
                 perf_counter() - connect_started_at,
@@ -385,9 +386,7 @@ async def stream_speech_pcm(
                     {"req_params": {"text": text[:1000]}},
                 )
             )
-            await tts_ws.send(
-                build_tts_frame(TTS_EVENT_FINISH_SESSION, session_id)
-            )
+            await tts_ws.send(build_tts_frame(TTS_EVENT_FINISH_SESSION, session_id))
 
             # 第四步：持续读取火山返回的二进制事件包。
             while True:

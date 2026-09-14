@@ -6,6 +6,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 """"设备表"""
+
+
 class Device(Base):
     __tablename__ = "device"
     id: Mapped[int] = mapped_column(
@@ -26,6 +28,13 @@ class Device(Base):
         nullable=False,
         comment="产品型号或产品系列标识",
     )
+    model_key: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=False,
+        default="doubao",
+        server_default=text("'doubao'"),
+        comment="设备使用的模型标识，默认 doubao",
+    )
     firmware_version: Mapped[str | None] = mapped_column(
         String(32),
         comment="固件版本",
@@ -34,7 +43,10 @@ class Device(Base):
         String(32),
         comment="硬件版本",
     )
-
+    active_agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        comment="当前激活的智能体，空则回落系统默认"
+    )
     # 数据库只保存摘要，不保存设备的原始密钥。
     device_secret_hash: Mapped[str | None] = mapped_column(
         String(255),

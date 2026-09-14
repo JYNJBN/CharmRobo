@@ -3,17 +3,19 @@ from openai import AsyncOpenAI
 from app.core.config import settings
 
 
-def get_embedding_client()->AsyncOpenAI:
+def get_embedding_client() -> AsyncOpenAI:
     if settings.siliconflow_api_key is None:
         raise RuntimeError("没有配置SILICONFLOW_API_KEY")
 
     return AsyncOpenAI(
         api_key=settings.siliconflow_api_key.get_secret_value(),
         # 清除右边多余/ 防止拼接出现//的情况
-        base_url=settings.siliconflow_base_url.rstrip('/'),
-        timeout=30
+        base_url=settings.siliconflow_base_url.rstrip("/"),
+        timeout=30,
     )
-async def embed_texts(texts:list[str])->list[list[float]]:
+
+
+async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     if any(not text.strip() for text in texts):
@@ -21,9 +23,7 @@ async def embed_texts(texts:list[str])->list[list[float]]:
     client = get_embedding_client()
 
     response = await client.embeddings.create(
-        model=settings.embedding_model,
-        input=texts,
-        encoding_format='float'
+        model=settings.embedding_model, input=texts, encoding_format="float"
     )
     # print(response.data,'response')
     items = sorted(response.data, key=lambda item: item.index)
@@ -37,8 +37,9 @@ async def embed_texts(texts:list[str])->list[list[float]]:
                 f"配置 {settings.embedding_dimension}"
             )
     return vectors
-async def embed_text(text:str)->list[float]:
+
+
+async def embed_text(text: str) -> list[float]:
     vectors = await embed_texts([text])
     # print("vectors[0]",vectors[0])
     return vectors[0]
-

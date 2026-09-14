@@ -1,7 +1,7 @@
-"""火山方舟 Responses API 集成。
+"""统一的大模型 Chat Completions 集成。
 
-这一层只负责把业务文字交给 Ark，并把结果转换成项目内部统一的文字格式。
-STT、TTS 和小程序 WebSocket 协议不需要知道 Ark 使用的是哪一种 API。
+上层只关心文字输入和文字增量输出；具体使用哪一家厂商、哪个 API Key、
+哪个 Base URL 和哪个模型 ID，由 model_service 中的模型配置决定。
 """
 
 import logging
@@ -11,56 +11,124 @@ from time import perf_counter
 from fastapi import HTTPException
 from openai import AsyncOpenAI
 
-from app.core.config import settings
+from app.schemas.Model import ModelRegistryObject
+from app.services.model_service import resolve_model
 
 logger = logging.getLogger(__name__)
-
-ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_PERSONA = "你是小梦机器人，由深圳市创梦龙公司开发。"
+STYLE_BASE = "回答尽可能简短，适合语音播报，不使用markdown和表情符号。由深圳市创梦龙公司开发。"
 SYSTEM_INSTRUCTIONS = (
-    "你是由深圳市创梦龙公司开发的小梦机器人。回答尽可能简短，优先用两到三句话回答。"
+    "你是小梦机器人，由深圳市创梦龙公司开发。"
+    "回答尽可能简短，优先用两到三句话回答，适合语音播报。"
 )
 MAX_OUTPUT_TOKENS = 300
 
 
-def get_ark_client() -> AsyncOpenAI:
-    """创建一个连接方舟的异步客户端。"""
+def build_instructions(
+        model_label: str | None = None,
+        persona: str | None = None,
+        agent_name: str | None = None,
+) -> str:
+    """拼装人设、回答风格、当前智能体名和模型名。"""
+    default_identity = (
+        f"你是“{agent_name}”智能体，由深圳市创梦龙公司开发。"
+        if agent_name
+        else DEFAULT_PERSONA
+    )
+    identity = persona.strip() if persona and persona.strip() else default_identity
+    parts = [identity, STYLE_BASE]
+    if agent_name:
+        parts.append(
+            f"当前设备使用的智能体名称是“{agent_name}”。"
+            "当用户询问你是什么智能体、当前使用哪个智能体或智能体叫什么时，"
+            f"直接回答当前使用的是“{agent_name}”智能体。"
+        )
+    if model_label:
+        parts.append(
+            f"当前设备使用的大模型是{model_label}，具体模型由系统自动选择。"
+            "当用户询问你现在使用的是什么大模型时，直接回答这个名称。"
+        )
+    return "\n".join(parts)
 
-    if settings.ark_api_key is None:
+
+def get_model_client(model_config: ModelRegistryObject) -> AsyncOpenAI:
+    """根据模型配置创建 OpenAI 兼容客户端。"""
+
+    api_key = model_config["api_key"]
+    if not api_key.get_secret_value():
         raise HTTPException(
             status_code=500,
-            detail="未配置 ARK_API_KEY",
+            detail=f"未配置 {model_config['provider']} API Key",
         )
 
     return AsyncOpenAI(
-        api_key=settings.ark_api_key.get_secret_value(),
-        base_url=ARK_BASE_URL,
+        api_key=api_key.get_secret_value(),
+        base_url=model_config["base_url"].rstrip("/"),
     )
 
 
-async def chat(
-    text: str,
-    trace_id: str = "standalone",
-    instructions: str = SYSTEM_INSTRUCTIONS,
-) -> str:
-    """使用 Responses API 进行一次性文字对话。"""
+def _build_messages(
+        *,
+        text: str | None,
+        messages: list[dict[str, str]] | None,
+        instructions: str,
+) -> list[dict[str, str]]:
+    """把系统提示词、历史消息和本轮文字组装成 Chat 消息。"""
 
-    client = get_ark_client()
-    logger.debug("text=%s instructions=%s", text, instructions)
+    if messages is None and text is None:
+        raise ValueError("text 或 messages 不能同时为空")
+
+    result: list[dict[str, str]] = []
+    if instructions:
+        result.append({"role": "system", "content": instructions})
+
+    if messages is not None:
+        result.extend(messages)
+    else:
+        result.append({"role": "user", "content": text or ""})
+
+    return result
+
+
+async def chat(
+        text: str,
+        trace_id: str = "standalone",
+        instructions: str = SYSTEM_INSTRUCTIONS,
+        model: ModelRegistryObject | None = None,
+) -> str:
+    """使用 Chat Completions 进行一次性文字对话。"""
+
+    model_config = model or resolve_model(None)
+    client = get_model_client(model_config)
+    messages = _build_messages(
+        text=text,
+        messages=None,
+        instructions=instructions,
+    )
+    logger.debug(
+        "text=%s instructions=%s provider=%s model=%s",
+        text,
+        instructions,
+        model_config["provider"],
+        model_config["model_id"],
+    )
     started_at = perf_counter()
+
     try:
-        response = await client.responses.create(
-            model=settings.ark_model,
-            instructions=instructions,
-            input=text,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            # 保存响应，后续接入 previous_response_id 时可以继续使用。
-            store=True,
+        response = await client.chat.completions.create(
+            model=model_config["model_id"],
+            messages=messages,
+            max_tokens=MAX_OUTPUT_TOKENS,
         )
 
-        answer = response.output_text or "我暂时没有想好怎么回答。"
+        answer = response.choices[0].message.content or (
+            "我暂时没有想好怎么回答。"
+        )
         logger.info(
-            "[VOICE-TIMING][%s][LLM] 非流式回答完成 total=%.3fs chars=%d",
+            "[LLM][%s] 非流式回答完成 provider=%s model=%s total=%.3fs chars=%d",
             trace_id,
+            model_config["provider"],
+            model_config["model_id"],
             perf_counter() - started_at,
             len(answer),
         )
@@ -70,23 +138,35 @@ async def chat(
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ark Responses 调用失败：{exc}",
+            detail=(
+                f"{model_config['provider']} Chat Completions 调用失败：{exc}"
+            ),
         ) from exc
 
 
 async def stream_chat(
-    text: str | None = None,
-    *,
-    messages: list[dict[str, str]] | None = None,
-    previous_response_id: str | None = None,
-    response_state: dict[str, str | None] | None = None,
-    trace_id: str = "standalone",
-    instructions: str = SYSTEM_INSTRUCTIONS,
+        text: str | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        previous_response_id: str | None = None,
+        response_state: dict[str, str | None] | None = None,
+        trace_id: str = "standalone",
+        instructions: str = SYSTEM_INSTRUCTIONS,
+        model: ModelRegistryObject | None = None,
 ) -> AsyncIterator[str]:
-    """使用 Responses API 流式返回文字增量。"""
+    """使用 Chat Completions 流式返回文字增量。"""
 
-    client = get_ark_client()
+    # Chat Completions 不使用 Responses API 的 previous_response_id。
+    # 保留这两个参数是为了兼容当前上层调用，实际上下文由 messages 提供。
+    _ = previous_response_id, response_state
 
+    model_config = model or resolve_model(None)
+    client = get_model_client(model_config)
+    llm_messages = _build_messages(
+        text=text,
+        messages=messages,
+        instructions=instructions,
+    )
     started_at = perf_counter()
     first_delta_received = False
     delta_count = 0
@@ -95,67 +175,38 @@ async def stream_chat(
 
     try:
         create_started_at = perf_counter()
-        if messages is None and text is None:
-            raise ValueError("text 或 messages 不能同时为空")
-        # llm_input =  text if messages is None else messages
-        llm_input = ""
-        if messages is None:
-            if text is None:
-                raise ValueError("text 或 messages 不能同时为空")
-            llm_input = text
-        else:
-            llm_input = messages
-        stream = await client.responses.create(
-            model=settings.ark_model,
-            instructions=instructions,
-            input=llm_input,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            # previous_response_id=previous_response_id,
-            store=True,
+        stream = await client.chat.completions.create(
+            model=model_config["model_id"],
+            messages=llm_messages,
+            max_tokens=MAX_OUTPUT_TOKENS,
             stream=True,
-            extra_body={
-                "thinking": {
-                    "type": "disabled",
-                }
-            },
         )
         logger.info(
-            "[VOICE-TIMING][%s][LLM] Responses 流已建立 elapsed=%.3fs model=%s",
+            "[LLM][%s] Chat Completions 流已建立 provider=%s model=%s elapsed=%.3fs",
             trace_id,
+            model_config["provider"],
+            model_config["model_id"],
             perf_counter() - create_started_at,
-            settings.ark_model,
         )
 
-        async for event in stream:
-            event_type = getattr(event, "type", "")
-            if event_type in {
-                "response.created",
-                "response.completed",
-            }:
-                response = getattr(event, "response", None)
-                response_id = getattr(response, "id", None)
-
-                if response_id and response_state is not None:
-                    response_state["response_id"] = response_id
-
-            if event_type == "response.output_text.delta":
-                delta = getattr(event, "delta", "") or ""
-                if delta:
-                    delta_count += 1
-                    character_count += len(delta)
-                    if not first_delta_received:
-                        first_delta_received = True
-                        logger.info(
-                            "[VOICE-TIMING][%s][LLM] 收到首个文字增量 ttft=%.3fs",
-                            trace_id,
-                            perf_counter() - started_at,
-                        )
-                    yield delta
+        async for chunk in stream:
+            if not chunk.choices:
                 continue
 
-            if event_type == "response.failed":
-                error = getattr(event, "error", None)
-                raise RuntimeError(f"Responses 流式响应失败：{error or event}")
+            delta = chunk.choices[0].delta.content or ""
+            if not delta:
+                continue
+
+            delta_count += 1
+            character_count += len(delta)
+            if not first_delta_received:
+                first_delta_received = True
+                logger.info(
+                    "[LLM][%s] 收到首个文字增量 ttft=%.3fs",
+                    trace_id,
+                    perf_counter() - started_at,
+                )
+            yield delta
 
         completed = True
 
@@ -164,37 +215,16 @@ async def stream_chat(
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ark Responses 流式调用失败：{exc}",
+            detail=(
+                f"{model_config['provider']} Chat Completions 流式调用失败：{exc}"
+            ),
         ) from exc
     finally:
         logger.info(
-            "[VOICE-TIMING][%s][LLM] 流式回答结束 total=%.3fs "
-            "status=%s deltas=%d chars=%d",
+            "[LLM][%s] 流式回答结束 total=%.3fs status=%s deltas=%d chars=%d",
             trace_id,
             perf_counter() - started_at,
             "success" if completed else "failed_or_cancelled",
             delta_count,
             character_count,
         )
-
-
-# 旧版 Chat Completions 调用方式保留作对照，不再执行：
-#
-# response = await client.chat.completions.create(
-#     model=settings.ark_model,
-#     messages=[
-#         {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-#         {"role": "user", "content": text},
-#     ],
-# )
-# answer = response.choices[0].message.content
-#
-# 旧版流式读取方式：
-#
-# stream = await client.chat.completions.create(
-#     model=settings.ark_model,
-#     messages=messages,
-#     stream=True,
-# )
-# async for chunk in stream:
-#     delta = chunk.choices[0].delta.content or ""

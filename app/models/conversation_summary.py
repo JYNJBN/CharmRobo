@@ -31,6 +31,11 @@ class ConversationSummary(Base):
         index=True,
         comment="所属设备 ID",
     )
+    agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        index=True,
+        comment="agent id"
+    )
     summary_text: Mapped[str] = mapped_column(Text, nullable=False, comment="摘要正文")
     covered_start_message_id: Mapped[int] = mapped_column(
         BigInteger,

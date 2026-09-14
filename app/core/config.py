@@ -1,11 +1,10 @@
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-
 class Settings(BaseSettings):
-    app_name: str="Charming Device API"
-    debug: bool=True
+    app_name: str = "Charming Device API"
+    debug: bool = True
     # 日志级别：DEBUG / INFO / WARNING / ERROR。
     # 容器里用环境变量 LOG_LEVEL 覆盖，例如 LOG_LEVEL=DEBUG。
     # 业务代码用 logging.getLogger(__name__) 打的日志受它控制。
@@ -33,14 +32,67 @@ class Settings(BaseSettings):
     jwt_secret_key: SecretStr
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 10080
-    # 语音key 模型配置
+    # llm配置
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     ark_api_key: SecretStr
-    ark_model: str
+    ark_deepseek_model: str | None = None
+    ark_doubao_model: str
+    qwen_api_key: SecretStr | None = None
+    qwen_base_url: str = (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    qwen_model: str | None = None
+    # 阿里 Qwen Audio 实时语音测试链路。实时 WebSocket 地址需要按阿里
+    # 控制台/工作空间配置；API Key 可单独配置，也可回退复用 qwen_api_key。
+    qwen_audio_realtime_api_key: SecretStr | None = None
+    qwen_audio_realtime_ws_url: str | None = None
+    qwen_audio_realtime_model: str = "qwen-audio-3.0-realtime-plus"
+    qwen_audio_realtime_voice: str = "longanqian"
+    qwen_audio_realtime_max_history_turns: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+    )
+    # 语音key 模型配置
     volc_asr_api_key: SecretStr | None = None
     volc_asr_resource_id: str = "volc.bigasr.auc_turbo"
     volc_stream_asr_resource_id: str = "volc.seedasr.sauc.duration"
     volc_tts_api_key: SecretStr | None = None
     volc_tts_resource_id: str = "seed-tts-2.0"
+    # 豆包实时语音模型 3.0（Seeduplex）全双工接口。
+    # 使用独立可选 Key；未单独配置时，代码会回退复用 volc_tts_api_key，
+    # 方便已有豆包语音应用先做开发测试。
+    volc_duplex_api_key: SecretStr | None = None
+    volc_duplex_ws_url: str = (
+        "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
+    )
+    volc_duplex_model: str = "1.2.6.1"
+    volc_duplex_voice: str = "zh_female_vv_jupiter_bigtts"
+    # 硬件语音链路使用的百度 ASR/TTS。全部密钥设为可选，避免未部署硬件时
+    # 影响原小程序 /api/v1/voice/stream 启动；真正收到硬件语音请求时再校验。
+    # OAuth 地址供 ASR/TTS 使用各自的 API Key + Secret Key 换取 Access Token。
+    baidu_oauth_url: str = "https://aip.baidubce.com/oauth/2.0/token"
+    # 百度短语音识别标准版 RAW 接口：上传完整 16k/16bit/mono 裸 PCM。
+    baidu_asr_url: str = "http://vop.baidu.com/server_api"
+    baidu_asr_api_key: SecretStr | None = None
+    baidu_asr_secret_key: SecretStr | None = None
+    # 1537 为普通话近场模型；当前硬件与 ASR 输入均固定 16 kHz。
+    baidu_asr_dev_pid: int = 1537
+    baidu_asr_sample_rate: int = 16000
+    # 百度流式文本在线合成 WebSocket：输入 LLM 短句，返回 MP3 二进制帧。
+    baidu_tts_ws_url: str = (
+        "wss://aip.baidubce.com/ws/2.0/speech/publiccloudspeech/v1/tts"
+    )
+    baidu_tts_api_key: SecretStr | None = None
+    baidu_tts_secret_key: SecretStr | None = None
+    # per=4146 是默认发音人；TTS 输出使用 aue=3 MP3 并降采样到 16 kHz。
+    baidu_tts_per: str = "4146"
+    baidu_tts_speed: int = 6
+    baidu_tts_pitch: int = 5
+    baidu_tts_volume: int = 5
+    baidu_tts_sample_rate: int = 16000
+    # 单轮网络上传总量上限，同时限制 PCM/Speex，防止异常设备无限占用内存。
+    hardware_voice_max_audio_bytes: int = 2 * 1024 * 1024
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问
     upload_dir: str = "uploads"
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。
@@ -54,10 +106,14 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_dimension: int = 1024
     embedding_metric_type: str = "COSINE"
+    # 长期记忆最低余弦相似度。当前 Milvus 使用 COSINE，分数越大越相关；
+    # 低于该值的 Top-K 候选不会回传给模型，避免不相关摘要干扰回答。
+    memory_min_similarity: float = Field(default=0.55, ge=-1, le=1)
     # 当前只维护对话摘要这一类向量数据
     milvus_summary_collection: str = "conversation_summary_v1"
     # Milvus 服务配置
     milvus_uri: str = "http://127.0.0.1:19530"
+
     @property
     def alembic_database_url(self) -> str:
         return (
@@ -66,4 +122,6 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}"
             f"/{self.postgres_database}"
         )
+
+
 settings = Settings()
