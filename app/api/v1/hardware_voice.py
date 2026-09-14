@@ -42,7 +42,6 @@ from fastapi import APIRouter, WebSocket
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.websockets import WebSocketDisconnect
 
-from app.api.v1.voice import summarize_conversation_in_background
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.errors import BizError
@@ -54,12 +53,16 @@ from app.integrations.hardware_audio import (
 from app.schemas.Model import ModelRegistryObject
 from app.services.agent_service import ensure_default_agent_on_device
 from app.services.conversation import run_turn
+from app.services.conversation_memory_service import (
+    summarize_conversation_in_background,
+)
 from app.services.conversation_service import (
     add_conversation_message,
     get_or_create_conversation,
     get_recent_messages,
 )
 from app.services.device_service import get_active_owner_binding, get_device_by_sn
+from app.services.hardware_actions import hardware_action_service
 from app.services.model_service import describe_model, resolve_model
 from app.utils.tools import local_now
 
@@ -129,6 +132,8 @@ class HardwareTurnResult:
     audio_chunks: int
     # 从收到 dialogue.start 到发送第一段 MP3 的耗时。
     first_chunk_ms: int
+    # chat/music/weather 等动作名称，供硬件调整播放策略和日志展示。
+    action: str = "chat"
 
 
 class _HardwareSentenceSplitter:
@@ -279,6 +284,8 @@ async def _run_hardware_turn(
     request_id: str,
     turn_started_at: float,
     send_bytes: SendBytes,
+    send_json: SendJson,
+    cancel_event: asyncio.Event,
 ) -> HardwareTurnResult:
     """执行一轮 ``音频 -> ASR -> LLM -> TTS -> MP3`` 流水线。
 
@@ -289,7 +296,12 @@ async def _run_hardware_turn(
     合成已经切好的前一句，从而缩短第一段声音到达硬件的时间。
     """
 
+    def check_cancelled() -> None:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError()
+
     # ==================== 阶段 1：统一为百度 ASR 所需 PCM ====================
+    check_cancelled()
     if audio_format == "speex":
         # CI Speex 解码会启动 FFmpeg 子进程；async 包装将阻塞工作放在线程中，
         # 防止一个设备解码时卡住 FastAPI 事件循环中的其他连接。
@@ -324,16 +336,72 @@ async def _run_hardware_turn(
         perf_counter() - asr_started_at,
         asr_text,
     )
-    # 用户原话以 ASR 最终文本落库，source=voice 在 _save_message 内统一设置。
-    await _save_message(session, role="user", content=asr_text)
+    check_cancelled()
 
-    # ==================== 阶段 3：LLM/TTS 并行流水线 ====================
-    # 队列中是完整短句；None 是结束哨兵，表示 LLM 不会再产生新句子。
-    tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    # 以下统计最终放入 dialogue.done，方便固件日志和服务端日志核对。
+    # ==================== 阶段 3：动作路由与统一音频输出 ====================
+    action_result = await hardware_action_service.resolve(asr_text, session.model)
+    check_cancelled()
+
     audio_bytes = 0
     audio_chunks = 0
     first_chunk_ms: int | None = None
+
+    async def send_audio_chunk(chunk: bytes) -> None:
+        nonlocal audio_bytes, audio_chunks, first_chunk_ms
+        check_cancelled()
+        if not chunk:
+            return
+        if first_chunk_ms is None:
+            first_chunk_ms = int((perf_counter() - turn_started_at) * 1000)
+        await send_bytes(chunk)
+        audio_bytes += len(chunk)
+        audio_chunks += 1
+
+    async def stream_tts_text(text: str) -> None:
+        if not text.strip():
+            return
+        async for chunk in baidu_speech_client.stream_synthesize_mp3(text):
+            await send_audio_chunk(chunk)
+
+    if action_result is not None:
+        # action 帧在第一段音频前发送，让固件知道本轮是音乐、天气还是兜底播报。
+        if action_result.action_payload:
+            await send_json(
+                {
+                    "type": "dialogue.action",
+                    "req": request_id,
+                    **action_result.action_payload,
+                }
+            )
+        if action_result.track is not None:
+            async for chunk in hardware_action_service.music.iter_track_bytes(
+                action_result.track,
+                cancel_event=cancel_event,
+            ):
+                await send_audio_chunk(chunk)
+            answer_text = action_result.answer_text or action_result.track.title
+        else:
+            await stream_tts_text(action_result.answer_text)
+            answer_text = action_result.answer_text
+        if not answer_text or audio_bytes == 0:
+            raise HardwareVoiceError("动作没有返回有效音频")
+        await _save_message(session, role="user", content=asr_text)
+        await _save_message(session, role="assistant", content=answer_text)
+        return HardwareTurnResult(
+            asr_text=asr_text,
+            answer_text=answer_text,
+            audio_bytes=audio_bytes,
+            audio_chunks=audio_chunks,
+            first_chunk_ms=first_chunk_ms
+            or int((perf_counter() - turn_started_at) * 1000),
+            action=action_result.action,
+        )
+
+    # ==================== 阶段 4：普通闲聊 LLM/TTS 并行流水线 ====================
+    # 普通闲聊才进入现有 Agent/LLM/记忆链路。
+    await _save_message(session, role="user", content=asr_text)
+    # 队列中是完整短句；None 是结束哨兵，表示 LLM 不会再产生新句子。
+    tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def tts_worker() -> None:
         """按顺序消费短句，将百度返回的 MP3 分片立即转发给 ESP32。"""
@@ -347,13 +415,7 @@ async def _run_hardware_turn(
                     return
                 # 每个 chunk 都是 MP3 字节流的一部分，不做 base64、不缓存完整文件。
                 async for chunk in baidu_speech_client.stream_synthesize_mp3(sentence):
-                    if first_chunk_ms is None:
-                        # 统计口径从 dialogue.start 开始，因此包含上传、解码、ASR、
-                        # LLM 首句和 TTS 首包的总等待时间。
-                        first_chunk_ms = int((perf_counter() - turn_started_at) * 1000)
-                    audio_bytes += len(chunk)
-                    audio_chunks += 1
-                    await send_bytes(chunk)
+                    await send_audio_chunk(chunk)
             finally:
                 # Queue 的每个 get 都必须对应 task_done，包括 None 和失败情况。
                 tts_queue.task_done()
@@ -378,6 +440,7 @@ async def _run_hardware_turn(
             model=session.model,
             model_label=session.model_label,
         ):
+            check_cancelled()
             # 一份用于最终落库，一份交给分句器驱动实时 TTS。
             reply_parts.append(delta)
             for sentence in splitter.feed(delta):
@@ -476,6 +539,84 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     connection_device_sn = (
         client.query_params.get("device_sn") or client.headers.get("x-device-sn") or ""
     ).strip()
+    connection_device_ip = client.headers.get("x-device-ip", "").strip()
+    client_req: object = None
+    turn_task: asyncio.Task[None] | None = None
+    turn_cancel_event: asyncio.Event | None = None
+
+    async def run_turn_worker(
+        *,
+        worker_request_id: str,
+        worker_client_req: object,
+        worker_cancel_event: asyncio.Event,
+        worker_session: HardwareSession,
+        worker_audio_data: bytes,
+        worker_audio_format: str,
+        worker_started_at: float,
+    ) -> None:
+        """后台执行一轮软件流水线，让主 WS 协程继续接收 cancel。"""
+
+        nonlocal turn_task, turn_cancel_event
+        try:
+            result = await _run_hardware_turn(
+                session=worker_session,
+                audio_data=worker_audio_data,
+                audio_format=worker_audio_format,
+                request_id=worker_request_id,
+                turn_started_at=worker_started_at,
+                send_bytes=send_bytes,
+                send_json=send_json,
+                cancel_event=worker_cancel_event,
+            )
+            if worker_cancel_event.is_set():
+                return
+            total_ms = int((perf_counter() - worker_started_at) * 1000)
+            await send_json(
+                {
+                    "type": "dialogue.done",
+                    "req": worker_request_id,
+                    "client_req": worker_client_req,
+                    "audio_bytes": result.audio_bytes,
+                    "audio_chunks": result.audio_chunks,
+                    "first_chunk_ms": result.first_chunk_ms,
+                    "total_ms": total_ms,
+                    "action": result.action,
+                }
+            )
+            logger.info(
+                "[HARDWARE-VOICE][%s] 本轮完成 action=%s total_ms=%d audio_bytes=%d",
+                worker_request_id,
+                result.action,
+                total_ms,
+                result.audio_bytes,
+            )
+        except asyncio.CancelledError:
+            return
+        except (HardwareVoiceError, HardwareAudioError, BaiduSpeechError) as exc:
+            if not worker_cancel_event.is_set():
+                await send_json(
+                    {
+                        "type": "dialogue.error",
+                        "req": worker_request_id,
+                        "client_req": worker_client_req,
+                        "error": str(exc),
+                    }
+                )
+        except Exception as exc:
+            logger.exception("[HARDWARE-VOICE][%s] 未预期异常", worker_request_id)
+            if not worker_cancel_event.is_set():
+                await send_json(
+                    {
+                        "type": "dialogue.error",
+                        "req": worker_request_id,
+                        "client_req": worker_client_req,
+                        "error": f"server error: {exc}",
+                    }
+                )
+        finally:
+            if turn_task is asyncio.current_task():
+                turn_task = None
+                turn_cancel_event = None
 
     logger.info("[HARDWARE-VOICE][%s] WebSocket 已连接", request_id)
     try:
@@ -549,12 +690,64 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 await send_json({"type": "pong"})
                 continue
 
+            if command_type == "device.online":
+                # 在线事件只做协议确认；真正的设备数据库校验仍在 dialogue.start
+                # 时完成，避免设备刚上线但未注册时阻塞长连接。
+                online_req = uuid.uuid4().hex[:8]
+                connection_device_sn = str(
+                    command.get("device_sn") or connection_device_sn
+                ).strip()
+                connection_device_ip = str(
+                    command.get("device_ip") or connection_device_ip
+                ).strip()
+                await send_json(
+                    {
+                        "type": "device.online.ack",
+                        "req": online_req,
+                    }
+                )
+                logger.info(
+                    "[HARDWARE-VOICE][%s] device.online device_sn=%s device_ip=%s",
+                    online_req,
+                    connection_device_sn,
+                    connection_device_ip,
+                )
+                continue
+
+            if command_type == "dialogue.cancel":
+                if turn_cancel_event is not None:
+                    turn_cancel_event.set()
+                if turn_task is not None and not turn_task.done():
+                    turn_task.cancel()
+                await send_json(
+                    {
+                        "type": "dialogue.cancelled",
+                        "req": request_id,
+                        "client_req": client_req,
+                        "reason": str(command.get("reason") or "client_cancel"),
+                    }
+                )
+                continue
+
             # ==================== 控制消息：dialogue.start ====================
             if command_type == "dialogue.start":
+                if turn_task is not None and not turn_task.done():
+                    await send_json(
+                        {
+                            "type": "dialogue.error",
+                            "req": request_id,
+                            "error": "previous dialogue is still running",
+                        }
+                    )
+                    continue
                 # 固件可传 req 便于两端日志对应；限制长度防止日志字段被滥用。
-                request_id = str(command.get("req") or uuid.uuid4().hex[:8])[:64]
+                request_id = uuid.uuid4().hex[:8]
+                client_req = command.get("client_req", command.get("req"))
                 device_sn = str(
                     command.get("device_sn") or connection_device_sn
+                ).strip()
+                connection_device_ip = str(
+                    command.get("device_ip") or connection_device_ip
                 ).strip()
                 if not device_sn:
                     await send_json(
@@ -668,7 +861,13 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 collecting = True
                 turn_started_at = perf_counter()
                 # ready 表示服务端已经准备好接收本轮二进制音频。
-                await send_json({"type": "dialogue.ready", "req": request_id})
+                await send_json(
+                    {
+                        "type": "dialogue.ready",
+                        "req": request_id,
+                        "client_req": client_req,
+                    }
+                )
                 logger.info(
                     "[HARDWARE-VOICE][%s] 开始收音 device_sn=%s format=%s expected=%s",
                     request_id,
@@ -724,59 +923,27 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 )
                 continue
 
-            # ==================== 执行业务流水线并返回本轮结果 ====================
-            try:
-                result = await _run_hardware_turn(
-                    session=session,
-                    audio_data=audio_data,
-                    audio_format=audio_format,
-                    request_id=request_id,
-                    turn_started_at=turn_started_at,
-                    send_bytes=send_bytes,
+            # ==================== 启动后台软件流水线 ====================
+            # 主 WebSocket 协程不能在这里直接 await，否则收到 dialogue.end 后就
+            # 无法继续接收 dialogue.cancel。流水线放到 Task 后，主循环继续收帧。
+            turn_cancel_event = asyncio.Event()
+            turn_task = asyncio.create_task(
+                run_turn_worker(
+                    worker_request_id=request_id,
+                    worker_client_req=client_req,
+                    worker_cancel_event=turn_cancel_event,
+                    worker_session=session,
+                    worker_audio_data=audio_data,
+                    worker_audio_format=audio_format,
+                    worker_started_at=turn_started_at,
                 )
-                total_ms = int((perf_counter() - turn_started_at) * 1000)
-                # dialogue.done 必须在最后一个 MP3 二进制帧之后发送，固件可据此
-                # 判断服务器不会再为本轮下发音频，并准备下一轮录音。
-                await send_json(
-                    {
-                        "type": "dialogue.done",
-                        "req": request_id,
-                        "audio_bytes": result.audio_bytes,
-                        "audio_chunks": result.audio_chunks,
-                        "first_chunk_ms": result.first_chunk_ms,
-                        "total_ms": total_ms,
-                    }
-                )
-                logger.info(
-                    "[HARDWARE-VOICE][%s] 本轮完成 total_ms=%d audio_bytes=%d",
-                    request_id,
-                    total_ms,
-                    result.audio_bytes,
-                )
-            # 可预期错误直接作为协议错误返回，连接仍保留供设备重试下一轮。
-            except (HardwareVoiceError, HardwareAudioError, BaiduSpeechError) as exc:
-                await send_json(
-                    {
-                        "type": "dialogue.error",
-                        "req": request_id,
-                        "error": str(exc),
-                    }
-                )
-            # 未预期异常保留完整服务端堆栈，但客户端只收到简化错误文本。
-            except Exception as exc:
-                logger.exception(
-                    "[HARDWARE-VOICE][%s] 未预期异常",
-                    request_id,
-                )
-                await send_json(
-                    {
-                        "type": "dialogue.error",
-                        "req": request_id,
-                        "error": f"server error: {exc}",
-                    }
-                )
+            )
     # 设备主动断线或服务停止取消任务都属于正常连接生命周期，不记异常堆栈。
     except (WebSocketDisconnect, asyncio.CancelledError):
+        if turn_cancel_event is not None:
+            turn_cancel_event.set()
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
         return
     finally:
         # finally 保证正常断线、异常退出、任务取消三种路径都有离线日志。

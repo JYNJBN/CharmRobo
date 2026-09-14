@@ -139,7 +139,7 @@ async def stream_voice_qwen(client: WebSocket) -> None:
         )
         # 等待qwen返回session.update 及确定配置传入
         await _wait_for_qwen_session_updated(upstream)
-    
+
         # Qwen 没有 Seeduplex 的 session.create.dialog_context 字段，重连时用
         # 官方 conversation.item.create 逐条恢复最近消息。发送顺序由同一条
         # WebSocket 保证，完成这些事件后才向小程序报告 ready。
@@ -296,9 +296,11 @@ async def stream_voice_qwen(client: WebSocket) -> None:
             persisted = await persist_e2e_turn(context, state)
             if not persisted:
                 return
-            # 复用原有后台摘要流程：消息先落 PostgreSQL，达到批次后生成摘要
+            # 复用共享后台摘要流程：消息先落 PostgreSQL，达到批次后生成摘要
             # 并 Embedding/upsert 到 Milvus。此处不再使用 Function Calling。
-            from app.api.v1.voice import summarize_conversation_in_background
+            from app.services.conversation_memory_service import (
+                summarize_conversation_in_background,
+            )
 
             asyncio.create_task(
                 summarize_conversation_in_background(

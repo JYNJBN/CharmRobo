@@ -25,8 +25,6 @@ from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.integrations.ai import chat, stream_chat
-from app.integrations.embedding import embed_text
-from app.integrations.milvus import upsert_summary
 from app.integrations.stt import (
     ASR_FLAG_FINAL,
     ASR_FLAG_NEG_SEQUENCE,
@@ -47,15 +45,18 @@ from app.schemas.voice import (
     VoiceChatRequest,
     VoiceChatResponse,
 )
-from app.services.agent_service import ensure_default_agent_on_device, get_active_agent_for_device
+from app.services.agent_service import (
+    ensure_default_agent_on_device,
+    get_active_agent_for_device,
+)
 from app.services.conversation import SentenceSplitter, run_turn
+from app.services.conversation_memory_service import (
+    summarize_conversation_in_background,
+)
 from app.services.conversation_service import (
     add_conversation_message,
-    get_recent_messages, get_or_create_conversation,
-)
-from app.services.conversation_summary_service import (
-    generate_conversation_summary,
-    get_latest_summary_end_message_id,
+    get_or_create_conversation,
+    get_recent_messages,
 )
 from app.services.device_service import (
     get_active_owner_binding,
@@ -115,73 +116,6 @@ async def _send_ws_json(client: WebSocket, data: dict[str, str]) -> None:
         await client.send_json(data)
     except (RuntimeError, WebSocketDisconnect):
         pass
-
-
-async def summarize_conversation_in_background(
-        conversation_id: int,
-        device_id: int | None,
-        user_id: int | None,
-        trace_id: str,
-        agent_id: int | None = None,
-) -> None:
-    """后台生成会话摘要，不阻塞当前语音回答。"""
-
-    try:
-        async with AsyncSessionLocal() as db:
-            last_covered_message_id = await get_latest_summary_end_message_id(
-                db,
-                conversation_id=conversation_id,
-            )
-
-            summary = await generate_conversation_summary(
-                db,
-                conversation_id=conversation_id,
-                device_id=device_id,
-                agent_id=agent_id,
-                last_covered_message_id=last_covered_message_id,
-                limit=settings.summary_batch_messages,
-                trace_id=f"{trace_id}-summary",
-            )
-
-            if summary is not None:
-                logger.info(
-                    "[SUMMARY][%s] 摘要生成成功 conversation_id=%s summary_id=%s",
-                    trace_id,
-                    conversation_id,
-                    summary.id,
-                )
-                if device_id is None or user_id is None or agent_id is None:
-                    logger.warning(
-                        "[MEMORY][%s] 缺少 device_id/user_id/agent_id，跳过 Milvus 写入",
-                        trace_id,
-                    )
-                    return
-                embedding_vector = await embed_text(summary.summary_text)
-                milvus_result = await asyncio.to_thread(
-                    upsert_summary,
-                    summary_id=summary.id,
-                    summary_text=summary.summary_text,
-                    embedding=embedding_vector,
-                    conversation_id=conversation_id,
-                    device_id=device_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    status=summary.status,
-                )
-
-                logger.info(
-                    "[MEMORY][%s] 摘要已写入 Milvus summary_id=%s result=%s",
-                    trace_id,
-                    summary.id,
-                    milvus_result,
-                )
-
-    except Exception:
-        logger.exception(
-            "[SUMMARY][%s] 后台生成摘要失败 conversation_id=%s",
-            trace_id,
-            conversation_id,
-        )
 
 
 @router.websocket("/tts-stream")

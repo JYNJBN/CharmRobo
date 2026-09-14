@@ -93,6 +93,19 @@ class Settings(BaseSettings):
     baidu_tts_sample_rate: int = 16000
     # 单轮网络上传总量上限，同时限制 PCM/Speex，防止异常设备无限占用内存。
     hardware_voice_max_audio_bytes: int = 2 * 1024 * 1024
+    # 软件动作层：默认关闭，打开后才扫描本地音乐、请求天气或调用 LLM 工具路由。
+    music_enable: bool = False
+    music_dir: str = "music"
+    music_chunk_bytes: int = 4096
+    weather_enable: bool = False
+    weather_default_city: str = "深圳"
+    qweather_api_host: str = "https://devapi.qweather.com"
+    qweather_api_key: SecretStr | None = None
+    qweather_timeout_sec: float = 5.0
+    tool_router_enable: bool = False
+    tool_router_timeout_sec: float = 4.0
+    tool_router_min_confidence: float = 0.65
+    tool_router_music_min_confidence: float = 0.75
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问
     upload_dir: str = "uploads"
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。

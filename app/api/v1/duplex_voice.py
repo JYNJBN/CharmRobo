@@ -22,7 +22,6 @@ from typing import Any
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from app.api.v1.voice import summarize_conversation_in_background
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.integrations.ai import build_instructions
@@ -46,6 +45,9 @@ from app.services.agent_change_notifier import register_agent_change_listener
 from app.services.agent_service import (
     ensure_default_agent_on_device,
     get_active_agent_for_device,
+)
+from app.services.conversation_memory_service import (
+    summarize_conversation_in_background,
 )
 from app.services.conversation_service import (
     add_conversation_message,
