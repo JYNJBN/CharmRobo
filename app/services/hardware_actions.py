@@ -444,9 +444,6 @@ class HardwareActionService:
             return None
 
 
-hardware_action_service = HardwareActionService()
-
-
 def _normalize(value: str) -> str:
     return re.sub(r"[\s\-_.·,，。！？?、（）()《》“”\"']", "", value or "").lower()
 
@@ -455,3 +452,7 @@ def _is_cancelled(cancel_event: object | None) -> bool:
     return bool(
         cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)()
     )
+
+
+# 辅助函数定义完成后再创建单例；创建时会扫描 music 目录并调用 _normalize。
+hardware_action_service = HardwareActionService()
