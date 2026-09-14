@@ -304,7 +304,12 @@ class BaiduSpeechClient:
 
         raise BaiduSpeechError("百度 ASR 鉴权重试失败")
 
-    async def stream_synthesize_mp3(self, text: str) -> AsyncIterator[bytes]:
+    async def stream_synthesize_mp3(
+        self,
+        text: str,
+        *,
+        per: str | None = None,
+    ) -> AsyncIterator[bytes]:
         """流式产出百度 TTS 返回的 16 kHz MP3 二进制分片。
 
         调用方应边迭代边发送给 ESP32，不应先 ``join`` 成完整 MP3，否则会失去
@@ -326,6 +331,7 @@ class BaiduSpeechClient:
                 async for chunk in self._stream_tts_once(
                     normalized_text[:1000],
                     token,
+                    per=per,
                 ):
                     yielded_audio = True
                     yield chunk
@@ -343,6 +349,8 @@ class BaiduSpeechClient:
         self,
         text: str,
         token: str,
+        *,
+        per: str | None = None,
     ) -> AsyncIterator[bytes]:
         """使用指定 Token 完成一次百度 TTS WebSocket 会话。
 
@@ -356,7 +364,7 @@ class BaiduSpeechClient:
         query = urllib.parse.urlencode(
             {
                 "access_token": token,
-                "per": self.config.baidu_tts_per,
+                "per": per or self.config.baidu_tts_per,
             }
         )
         url = f"{self.config.baidu_tts_ws_url}?{query}"

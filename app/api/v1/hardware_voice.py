@@ -64,6 +64,7 @@ from app.services.conversation_service import (
 from app.services.device_service import get_active_owner_binding, get_device_by_sn
 from app.services.hardware_actions import hardware_action_service
 from app.services.model_service import describe_model, resolve_model
+from app.services.voice_service import resolve_baidu_tts_per
 from app.utils.tools import local_now
 
 router = APIRouter(prefix="/v1", tags=["硬件语音"])
@@ -112,6 +113,8 @@ class HardwareSession:
     # 智能体名称和人设提示词，最终注入现有 run_turn。
     agent_name: str
     agent_system_prompt: str | None
+    # Agent 保存的是中立 voice key，硬件线路在服务端映射成百度 per。
+    voice: str | None
     # 当前智能体对应的会话及其最近若干条短期上下文。
     conversation_id: int
     history_messages: list[dict[str, str]]
@@ -247,6 +250,7 @@ async def _load_hardware_session(device_sn: str) -> HardwareSession:
             agent_id=agent.id,
             agent_name=agent.name,
             agent_system_prompt=agent.system_prompt,
+            voice=agent.voice,
             conversation_id=conversation.id,
             history_messages=history_messages,
             model=model,
@@ -341,6 +345,8 @@ async def _run_hardware_turn(
     # ==================== 阶段 3：动作路由与统一音频输出 ====================
     action_result = await hardware_action_service.resolve(asr_text, session.model)
     check_cancelled()
+    # 当前 Agent 的音色在每轮 start 时重新读取；切换 Agent 后下一轮立即生效。
+    baidu_per = resolve_baidu_tts_per(session.voice)
 
     audio_bytes = 0
     audio_chunks = 0
@@ -360,7 +366,10 @@ async def _run_hardware_turn(
     async def stream_tts_text(text: str) -> None:
         if not text.strip():
             return
-        async for chunk in baidu_speech_client.stream_synthesize_mp3(text):
+        async for chunk in baidu_speech_client.stream_synthesize_mp3(
+            text,
+            per=baidu_per,
+        ):
             await send_audio_chunk(chunk)
 
     if action_result is not None:
@@ -414,7 +423,10 @@ async def _run_hardware_turn(
                 if sentence is None:
                     return
                 # 每个 chunk 都是 MP3 字节流的一部分，不做 base64、不缓存完整文件。
-                async for chunk in baidu_speech_client.stream_synthesize_mp3(sentence):
+                async for chunk in baidu_speech_client.stream_synthesize_mp3(
+                    sentence,
+                    per=baidu_per,
+                ):
                     await send_audio_chunk(chunk)
             finally:
                 # Queue 的每个 get 都必须对应 task_done，包括 None 和失败情况。
