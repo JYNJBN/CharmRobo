@@ -7,7 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 from app.api.health import router as health_router
-from app.api.v1.hardware_voice import router as hardware_voice_router
+
+# 旧硬件链路实现（百度 ASR + 文本 LLM + 百度 TTS + 动作路由）。
+# 文件仍保留在 app/api/v1/hardware_voice.py，只是暂时不再注册；回滚时把这行
+# import 和下方对应的 include_router 一起恢复即可。
+# from app.api.v1.hardware_voice import router as hardware_voice_router
+from app.api.v1.hardware_voice_qwen import router as hardware_voice_qwen_router
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.errors import BizError
@@ -126,7 +131,12 @@ app.include_router(health_router)
 app.include_router(api_router)
 # 硬件路由故意单独注册在应用根级别，使最终地址保持为 /v1/dialogue/ws；
 # 原 api_router 的 /api/v1/voice/stream 继续服务小程序，两者不会互相覆盖。
-app.include_router(hardware_voice_router)
+#
+# 【2026-09-15 切换】硬件链路默认改走阿里 Qwen Audio 端到端实现
+# （app/api/v1/hardware_voice_qwen.py）。路径和帧协议完全不变，所以固件一行
+# 都不用改；旧实现只注释注册、文件保留，需要回滚时把下面两行互换即可。
+# app.include_router(hardware_voice_router)
+app.include_router(hardware_voice_qwen_router)
 
 # 上传文件的静态访问：/static/xxx → uploads/xxx
 app.mount("/static", StaticFiles(directory=upload_dir), name="static")
