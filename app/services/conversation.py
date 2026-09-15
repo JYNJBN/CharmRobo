@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator
+from time import perf_counter
 
 from app.integrations.ai import build_instructions, stream_chat
 from app.integrations.embedding import embed_text
@@ -104,9 +105,35 @@ async def run_turn(
         {"role": "user", "content": user_text},
     ]
     if user_id is not None and agent_id is not None:
+        memory_started_at = perf_counter()
+        logger.info(
+            "[记忆][语义检索][%s] 开始 user_id=%s agent_id=%s "
+            "conversation_id=%s 问题字数=%d TopK=%d",
+            trace_id,
+            user_id,
+            agent_id,
+            conversation_id,
+            len(user_text),
+            3,
+        )
         try:
-            # 向量化用户查询
+            embedding_started_at = perf_counter()
+            logger.info(
+                "[记忆][Embedding][%s] 开始 问题字数=%d",
+                trace_id,
+                len(user_text),
+            )
             query_vector = await embed_text(user_text)
+            embedding_elapsed = perf_counter() - embedding_started_at
+            logger.info(
+                "[记忆][Embedding][%s] 完成 向量维度=%d 耗时=%.3f秒",
+                trace_id,
+                len(query_vector),
+                embedding_elapsed,
+            )
+
+            milvus_started_at = perf_counter()
+            logger.info("[记忆][Milvus读取][%s] 开始 TopK=%d", trace_id, 3)
             search_results = await asyncio.to_thread(
                 search_summaries,
                 query_vector=query_vector,
@@ -114,9 +141,17 @@ async def run_turn(
                 agent_id=agent_id,
                 limit=3,
             )
+            milvus_elapsed = perf_counter() - milvus_started_at
+            logger.info(
+                "[记忆][Milvus读取][%s] 完成 耗时=%.3f秒",
+                trace_id,
+                milvus_elapsed,
+            )
             memory_lines: list[str] = []
+            candidate_count = 0
             for hits in search_results:
                 for hit in hits:
+                    candidate_count += 1
                     entity = hit.get("entity", {})
                     summary_text = entity.get("summary_text")
                     if summary_text:
@@ -134,19 +169,51 @@ async def run_turn(
                         "content": memory_context,
                     },
                 )
+                logger.info(
+                    "[记忆][语义检索][%s] 已注入 LLM 上下文 "
+                    "候选数=%d 命中数=%d 总耗时=%.3f秒",
+                    trace_id,
+                    candidate_count,
+                    len(memory_lines),
+                    perf_counter() - memory_started_at,
+                )
+            else:
+                logger.info(
+                    "[记忆][语义检索][%s] 没有可注入记忆 "
+                    "候选数=%d 总耗时=%.3f秒",
+                    trace_id,
+                    candidate_count,
+                    perf_counter() - memory_started_at,
+                )
         except Exception:
             logger.exception(
-                "长期记忆检索失败 conversation_id=%s",
+                "[记忆][语义检索][%s] 失败 conversation_id=%s "
+                "耗时=%.3f秒",
+                trace_id,
                 conversation_id,
+                perf_counter() - memory_started_at,
             )
+    else:
+        logger.debug(
+            "[记忆][语义检索][%s] 跳过：缺少 user_id 或 agent_id",
+            trace_id,
+        )
 
-    # 调 LLM 流式生成，直接转发增量。记忆检索 / 工具调用未来在这里包裹。
+    # 记忆检索结束后才真正发起 LLM 请求；这条日志用于把“检索耗时”和
+    # “LLM 首字/完整输出耗时”分开统计。
     # 有 model_label 时把它注入系统提示词，模型才能回答"你现在用的什么模型"；
     # 大模型自己感知不到运行在哪个模型/endpoint 上，不注入就只会瞎猜。
     instructions = build_instructions(
         model_label=model_label,
         persona=agent_system_prompt,
         agent_name=agent_name,
+    )
+    logger.info(
+        "[对话][LLM][%s] 开始请求上游 conversation_id=%s "
+        "消息数=%d",
+        trace_id,
+        conversation_id,
+        len(messages),
     )
     async for delta in stream_chat(
             messages=messages,

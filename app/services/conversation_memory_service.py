@@ -42,13 +42,34 @@ async def summarize_conversation_in_background(
     向量写入。所有异常在后台吞掉并记录，不能反向破坏已经完成的对话。
     """
 
+    started_at = asyncio.get_running_loop().time()
+    logger.info(
+        "[记忆][后台任务][%s] 开始 conversation_id=%s user_id=%s "
+        "device_id=%s agent_id=%s 批次=%s",
+        trace_id,
+        conversation_id,
+        user_id,
+        device_id,
+        agent_id,
+        settings.summary_batch_messages,
+    )
     try:
         async with AsyncSessionLocal() as db:
+            pointer_started_at = asyncio.get_running_loop().time()
             last_covered_message_id = await get_latest_summary_end_message_id(
                 db,
                 conversation_id=conversation_id,
             )
+            logger.info(
+                "[记忆][后台任务][%s] 已读取摘要进度 conversation_id=%s "
+                "last_covered_message_id=%s 耗时=%.3f秒",
+                trace_id,
+                conversation_id,
+                last_covered_message_id,
+                asyncio.get_running_loop().time() - pointer_started_at,
+            )
 
+            summary_started_at = asyncio.get_running_loop().time()
             summary = await generate_conversation_summary(
                 db,
                 conversation_id=conversation_id,
@@ -58,8 +79,17 @@ async def summarize_conversation_in_background(
                 limit=settings.summary_batch_messages,
                 trace_id=f"{trace_id}-summary",
             )
+            summary_elapsed = asyncio.get_running_loop().time() - summary_started_at
 
             if summary is None:
+                logger.info(
+                    "[记忆][后台任务][%s] 未达到摘要批次，跳过向量写入 "
+                    "conversation_id=%s 摘要阶段耗时=%.3f秒 总耗时=%.3f秒",
+                    trace_id,
+                    conversation_id,
+                    summary_elapsed,
+                    asyncio.get_running_loop().time() - started_at,
+                )
                 return
 
             logger.info(
@@ -67,6 +97,7 @@ async def summarize_conversation_in_background(
                 trace_id,
                 conversation_id,
                 summary.id,
+                # summary 返回时已经完成 conversation_summary 的数据库提交。
             )
 
             if device_id is None or user_id is None or agent_id is None:
@@ -76,8 +107,30 @@ async def summarize_conversation_in_background(
                 )
                 return
 
+            embedding_started_at = asyncio.get_running_loop().time()
+            logger.info(
+                "[记忆][Embedding][%s] 摘要向量化开始 summary_id=%s "
+                "摘要字数=%d",
+                trace_id,
+                summary.id,
+                len(summary.summary_text),
+            )
             embedding_vector = await embed_text(summary.summary_text)
+            logger.info(
+                "[记忆][Embedding][%s] 摘要向量化完成 summary_id=%s "
+                "向量维度=%d 耗时=%.3f秒",
+                trace_id,
+                summary.id,
+                len(embedding_vector),
+                asyncio.get_running_loop().time() - embedding_started_at,
+            )
             # pymilvus 是同步客户端，放到线程中，避免阻塞 FastAPI 事件循环。
+            milvus_started_at = asyncio.get_running_loop().time()
+            logger.info(
+                "[记忆][Milvus写入][%s] 开始 summary_id=%s",
+                trace_id,
+                summary.id,
+            )
             milvus_result = await asyncio.to_thread(
                 upsert_summary,
                 summary_id=summary.id,
@@ -91,15 +144,19 @@ async def summarize_conversation_in_background(
             )
 
             logger.info(
-                "[MEMORY][%s] 摘要已写入 Milvus summary_id=%s result=%s",
+                "[记忆][Milvus写入][%s] 完成 summary_id=%s result=%s "
+                "耗时=%.3f秒 总耗时=%.3f秒",
                 trace_id,
                 summary.id,
                 milvus_result,
+                asyncio.get_running_loop().time() - milvus_started_at,
+                asyncio.get_running_loop().time() - started_at,
             )
 
     except Exception:
         logger.exception(
-            "[SUMMARY][%s] 后台生成摘要失败 conversation_id=%s",
+            "[记忆][后台任务][%s] 失败 conversation_id=%s 总耗时=%.3f秒",
             trace_id,
             conversation_id,
+            asyncio.get_running_loop().time() - started_at,
         )

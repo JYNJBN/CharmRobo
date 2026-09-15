@@ -399,7 +399,21 @@ async def retrieve_e2e_long_term_memories(
         settings.memory_min_similarity,
     )
     try:
+        embedding_started_at = perf_counter()
+        logger.info(
+            "[E2E][记忆][%s] Embedding 开始 问题字数=%d",
+            trace_id,
+            len(text),
+        )
         query_vector = await embed_text(text)
+        logger.info(
+            "[E2E][记忆][%s] Embedding 完成 向量维度=%d 耗时=%.3f秒",
+            trace_id,
+            len(query_vector),
+            perf_counter() - embedding_started_at,
+        )
+        milvus_started_at = perf_counter()
+        logger.info("[E2E][记忆][%s] Milvus 检索开始 TopK=%d", trace_id, limit)
         search_results = await asyncio.to_thread(
             search_summaries,
             query_vector=query_vector,
@@ -407,12 +421,19 @@ async def retrieve_e2e_long_term_memories(
             agent_id=agent_id,
             limit=limit,
         )
+        logger.info(
+            "[E2E][记忆][%s] Milvus 检索完成 耗时=%.3f秒",
+            trace_id,
+            perf_counter() - milvus_started_at,
+        )
     except Exception:
         logger.exception(
-            "[E2E][记忆][%s] 语义记忆检索失败 user_id=%s agent_id=%s",
+            "[E2E][记忆][%s] 语义记忆检索失败 user_id=%s agent_id=%s "
+            "总耗时=%.3f秒",
             trace_id,
             user_id,
             agent_id,
+            perf_counter() - started_at,
         )
         return []
 

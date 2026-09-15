@@ -190,7 +190,11 @@ class _HardwareSentenceSplitter:
         return 0
 
 
-async def _load_hardware_session(device_sn: str) -> HardwareSession:
+async def _load_hardware_session(
+    device_sn: str,
+    *,
+    trace_id: str = "unknown",
+) -> HardwareSession:
     """校验硬件并加载当前智能体、模型和对话历史。
 
     每轮 ``dialogue.start`` 都重新调用，而不是只在 WebSocket 建连时调用。
@@ -201,20 +205,42 @@ async def _load_hardware_session(device_sn: str) -> HardwareSession:
     任一步失败都会转成 ``dialogue.error``，不会调用收费的语音/模型接口。
     """
 
+    started_at = perf_counter()
+    logger.info(
+        "[HARDWARE-VOICE][%s][会话] 开始加载 device_sn=%s",
+        trace_id,
+        device_sn,
+    )
     async with AsyncSessionLocal() as db:
+        device_started_at = perf_counter()
         # device_sn 是硬件和数据库设备记录之间的唯一关联键。
         device = await get_device_by_sn(db, device_sn)
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] 设备查询完成 存在=%s 耗时=%.3f秒",
+            trace_id,
+            device is not None,
+            perf_counter() - device_started_at,
+        )
         if device is None:
             raise HardwareVoiceError("设备不存在或已删除")
         if device.status != 1:
             raise HardwareVoiceError("设备已被禁用")
 
         # 硬件没有用户 JWT，因此通过设备绑定表反查当前 owner 用户。
+        owner_started_at = perf_counter()
         owner_binding = await get_active_owner_binding(db, device_id=device.id)
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] 设备归属查询完成 已绑定=%s "
+            "耗时=%.3f秒",
+            trace_id,
+            owner_binding is not None,
+            perf_counter() - owner_started_at,
+        )
         if owner_binding is None:
             raise HardwareVoiceError("设备尚未绑定用户")
 
         # 老设备可能尚未物化默认智能体；该服务会补齐默认副本并返回当前智能体。
+        agent_started_at = perf_counter()
         agent = await ensure_default_agent_on_device(db=db, device=device)
         if agent is None:
             raise HardwareVoiceError("设备没有可用智能体")
@@ -223,6 +249,13 @@ async def _load_hardware_session(device_sn: str) -> HardwareSession:
         # 内部只 flush，所以在这里和 last_online_time 一起统一提交。
         device.last_online_time = local_now()
         await db.commit()
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] Agent/设备状态准备完成 agent_id=%s "
+            "耗时=%.3f秒",
+            trace_id,
+            agent.id,
+            perf_counter() - agent_started_at,
+        )
 
         # 将数据库里的 model_key 解析成现有 LLM 层可直接使用的模型配置。
         model = resolve_model(agent.model_key)
@@ -230,17 +263,35 @@ async def _load_hardware_session(device_sn: str) -> HardwareSession:
 
         # 会话按当前智能体复用。切换智能体后会得到另一条 conversation，历史不会
         # 混到旧智能体中。
+        conversation_started_at = perf_counter()
         conversation = await get_or_create_conversation(
             db,
             user_id=owner_binding.user_id,
             device_id=device.id,
             agent_id=agent.id,
         )
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] conversation 准备完成 "
+            "conversation_id=%s 耗时=%.3f秒",
+            trace_id,
+            conversation.id,
+            perf_counter() - conversation_started_at,
+        )
         # 只取配置数量的最近消息，避免提示词随对话无限增长。
+        history_started_at = perf_counter()
         history_messages = await get_recent_messages(
             db,
             conversation_id=conversation.id,
             limit=settings.short_term_context_messages,
+        )
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] 短期记忆读取完成 "
+            "conversation_id=%s 条数=%d 耗时=%.3f秒 总耗时=%.3f秒",
+            trace_id,
+            conversation.id,
+            len(history_messages),
+            perf_counter() - history_started_at,
+            perf_counter() - started_at,
         )
 
         return HardwareSession(
@@ -304,6 +355,16 @@ async def _run_hardware_turn(
         if cancel_event.is_set():
             raise asyncio.CancelledError()
 
+    processing_started_at = perf_counter()
+    logger.info(
+        "[HARDWARE-VOICE][%s][时序] 语音处理开始 format=%s "
+        "上传字节=%d 距 dialogue.start=%.3f秒",
+        request_id,
+        audio_format,
+        len(audio_data),
+        processing_started_at - turn_started_at,
+    )
+
     # ==================== 阶段 1：统一为百度 ASR 所需 PCM ====================
     check_cancelled()
     if audio_format == "speex":
@@ -321,6 +382,13 @@ async def _run_hardware_turn(
     else:
         # PCM 模式已经是 16k/16bit/单声道裸数据，不需要再次转码。
         pcm = audio_data
+        logger.info(
+            "[HARDWARE-VOICE][%s][音频] PCM 无需解码 字节=%d "
+            "耗时=%.3f秒",
+            request_id,
+            len(pcm),
+            perf_counter() - processing_started_at,
+        )
 
     # 百度短语音标准版限制 60 秒。Speex 很小，因此必须在解码后用 PCM 大小
     # 判断真实时长，不能只看网络上传的压缩字节数。
@@ -335,15 +403,26 @@ async def _run_hardware_turn(
         cuid=session.device_sn,
     )
     logger.info(
-        "[HARDWARE-VOICE][%s] 百度 ASR 完成 elapsed=%.3fs text=%s",
+        "[HARDWARE-VOICE][%s][百度ASR] 完成 elapsed=%.3fs "
+        "距处理开始=%.3f秒 text=%s",
         request_id,
         perf_counter() - asr_started_at,
+        perf_counter() - processing_started_at,
         asr_text,
     )
     check_cancelled()
 
     # ==================== 阶段 3：动作路由与统一音频输出 ====================
+    action_started_at = perf_counter()
+    logger.info("[HARDWARE-VOICE][%s][动作] 开始判断", request_id)
     action_result = await hardware_action_service.resolve(asr_text, session.model)
+    logger.info(
+        "[HARDWARE-VOICE][%s][动作] 判断完成 action=%s "
+        "耗时=%.3f秒",
+        request_id,
+        action_result.action if action_result is not None else "chat",
+        perf_counter() - action_started_at,
+    )
     check_cancelled()
     # 当前 Agent 的音色在每轮 start 时重新读取；切换 Agent 后下一轮立即生效。
     baidu_per = resolve_baidu_tts_per(session.voice)
@@ -359,6 +438,13 @@ async def _run_hardware_turn(
             return
         if first_chunk_ms is None:
             first_chunk_ms = int((perf_counter() - turn_started_at) * 1000)
+            logger.info(
+                "[HARDWARE-VOICE][%s][TTS] 首个下行音频块 "
+                "距 dialogue.start=%.3f秒 字节=%d",
+                request_id,
+                perf_counter() - turn_started_at,
+                len(chunk),
+            )
         await send_bytes(chunk)
         audio_bytes += len(chunk)
         audio_chunks += 1
@@ -366,11 +452,25 @@ async def _run_hardware_turn(
     async def stream_tts_text(text: str) -> None:
         if not text.strip():
             return
+        tts_started_at = perf_counter()
+        logger.info(
+            "[HARDWARE-VOICE][%s][百度TTS] 开始 per=%s 文本字数=%d",
+            request_id,
+            baidu_per,
+            len(text),
+        )
         async for chunk in baidu_speech_client.stream_synthesize_mp3(
             text,
             per=baidu_per,
         ):
             await send_audio_chunk(chunk)
+        logger.info(
+            "[HARDWARE-VOICE][%s][百度TTS] 完成 文本字数=%d "
+            "耗时=%.3f秒",
+            request_id,
+            len(text),
+            perf_counter() - tts_started_at,
+        )
 
     if action_result is not None:
         # action 帧在第一段音频前发送，让固件知道本轮是音乐、天气还是兜底播报。
@@ -383,11 +483,26 @@ async def _run_hardware_turn(
                 }
             )
         if action_result.track is not None:
+            music_started_at = perf_counter()
+            logger.info(
+                "[HARDWARE-VOICE][%s][音乐] 开始发送歌曲 title=%s "
+                "文件字节=%d",
+                request_id,
+                action_result.track.title,
+                action_result.track.size,
+            )
             async for chunk in hardware_action_service.music.iter_track_bytes(
                 action_result.track,
                 cancel_event=cancel_event,
             ):
                 await send_audio_chunk(chunk)
+            logger.info(
+                "[HARDWARE-VOICE][%s][音乐] 文件发送完成 title=%s "
+                "耗时=%.3f秒",
+                request_id,
+                action_result.track.title,
+                perf_counter() - music_started_at,
+            )
             answer_text = action_result.answer_text or action_result.track.title
         else:
             await stream_tts_text(action_result.answer_text)
@@ -396,6 +511,15 @@ async def _run_hardware_turn(
             raise HardwareVoiceError("动作没有返回有效音频")
         await _save_message(session, role="user", content=asr_text)
         await _save_message(session, role="assistant", content=answer_text)
+        logger.info(
+            "[HARDWARE-VOICE][%s][时序] 动作分支完成 action=%s "
+            "总耗时=%.3f秒 音频字节=%d 分片=%d",
+            request_id,
+            action_result.action,
+            perf_counter() - turn_started_at,
+            audio_bytes,
+            audio_chunks,
+        )
         return HardwareTurnResult(
             asr_text=asr_text,
             answer_text=answer_text,
@@ -409,6 +533,15 @@ async def _run_hardware_turn(
     # ==================== 阶段 4：普通闲聊 LLM/TTS 并行流水线 ====================
     # 普通闲聊才进入现有 Agent/LLM/记忆链路。
     await _save_message(session, role="user", content=asr_text)
+    llm_pipeline_started_at = perf_counter()
+    first_llm_delta_at: float | None = None
+    logger.info(
+        "[HARDWARE-VOICE][%s][LLM] 阶段开始（包含前置记忆检索） "
+        "model=%s 短期消息数=%d",
+        request_id,
+        session.model_label,
+        len(session.history_messages),
+    )
     # 队列中是完整短句；None 是结束哨兵，表示 LLM 不会再产生新句子。
     tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
@@ -423,11 +556,24 @@ async def _run_hardware_turn(
                 if sentence is None:
                     return
                 # 每个 chunk 都是 MP3 字节流的一部分，不做 base64、不缓存完整文件。
+                sentence_started_at = perf_counter()
+                logger.info(
+                    "[HARDWARE-VOICE][%s][百度TTS] 句子开始 文本字数=%d",
+                    request_id,
+                    len(sentence),
+                )
                 async for chunk in baidu_speech_client.stream_synthesize_mp3(
                     sentence,
                     per=baidu_per,
                 ):
                     await send_audio_chunk(chunk)
+                logger.info(
+                    "[HARDWARE-VOICE][%s][百度TTS] 句子完成 文本字数=%d "
+                    "耗时=%.3f秒",
+                    request_id,
+                    len(sentence),
+                    perf_counter() - sentence_started_at,
+                )
             finally:
                 # Queue 的每个 get 都必须对应 task_done，包括 None 和失败情况。
                 tts_queue.task_done()
@@ -453,6 +599,15 @@ async def _run_hardware_turn(
             model_label=session.model_label,
         ):
             check_cancelled()
+            if first_llm_delta_at is None:
+                first_llm_delta_at = perf_counter()
+                logger.info(
+                    "[HARDWARE-VOICE][%s][LLM] 首个文字增量 "
+                    "距LLM阶段开始=%.3f秒 距dialogue.start=%.3f秒",
+                    request_id,
+                    first_llm_delta_at - llm_pipeline_started_at,
+                    first_llm_delta_at - turn_started_at,
+                )
             # 一份用于最终落库，一份交给分句器驱动实时 TTS。
             reply_parts.append(delta)
             for sentence in splitter.feed(delta):
@@ -460,9 +615,27 @@ async def _run_hardware_turn(
         # LLM 结束后处理没有标点的尾句，再发送 None 让 worker 正常退出。
         for sentence in splitter.flush():
             await tts_queue.put(sentence)
+        llm_stream_finished_at = perf_counter()
+        logger.info(
+            "[HARDWARE-VOICE][%s][LLM] 上游文字流结束 回复字数=%d "
+            "阶段耗时=%.3f秒 首字耗时=%.3f秒",
+            request_id,
+            sum(len(part) for part in reply_parts),
+            llm_stream_finished_at - llm_pipeline_started_at,
+            first_llm_delta_at - llm_pipeline_started_at
+            if first_llm_delta_at
+            else 0.0,
+        )
         await tts_queue.put(None)
         # 必须等 TTS worker 发完所有 MP3，外层才能安全发送 dialogue.done。
         await worker_task
+        logger.info(
+            "[HARDWARE-VOICE][%s][百度TTS] 所有句子发送完成 "
+            "等待TTS耗时=%.3f秒 总阶段耗时=%.3f秒",
+            request_id,
+            perf_counter() - llm_stream_finished_at,
+            perf_counter() - llm_pipeline_started_at,
+        )
     except Exception:
         # LLM、TTS 或 WebSocket 发送任一失败，都取消后台 worker，避免任务泄漏、
         # 后续继续向已经失败/关闭的连接发送音频。
@@ -490,6 +663,19 @@ async def _run_hardware_turn(
             trace_id=request_id,
         )
     )
+    logger.info(
+        "[HARDWARE-VOICE][%s][记忆] 已提交摘要/向量后台任务 "
+        "当前轮不等待后台写入",
+        request_id,
+    )
+    logger.info(
+        "[HARDWARE-VOICE][%s][时序] 语音处理完成 "
+        "总耗时=%.3f秒 音频字节=%d 分片=%d",
+        request_id,
+        perf_counter() - turn_started_at,
+        audio_bytes,
+        audio_chunks,
+    )
 
     return HardwareTurnResult(
         asr_text=asr_text,
@@ -515,7 +701,15 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     """
 
     # WebSocket 握手由 FastAPI 完成；accept 后才能收发应用数据。
+    connection_started_at = perf_counter()
     await client.accept()
+    connection_id = uuid.uuid4().hex[:8]
+    logger.info(
+        "[HARDWARE-VOICE][%s][连接] WebSocket 已建立 "
+        "wss握手耗时=%.3f秒",
+        connection_id,
+        perf_counter() - connection_started_at,
+    )
 
     # LLM 主协程和 TTS worker 可能并发发送；Starlette 不保证同一 WebSocket 的
     # 并发 send 安全，所以所有文本/二进制发送都必须经过同一把锁。
@@ -539,6 +733,8 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     # WebSocket 可能把一段录音拆成任意数量的二进制消息，先按片保存，end 时拼接。
     audio_parts: list[bytes] = []
     received_bytes = 0
+    received_frame_count = 0
+    first_audio_frame_at: float | None = None
     # 客户端可不声明大小；声明后在 end 阶段精确校验是否丢包/固件计数错误。
     expected_audio_bytes: int | None = None
     # 为兼容旧固件，未声明格式时按 PCM；新 CI 压缩固件应显式发 speex。
@@ -569,6 +765,15 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
         """后台执行一轮软件流水线，让主 WS 协程继续接收 cancel。"""
 
         nonlocal turn_task, turn_cancel_event
+        worker_started_processing_at = perf_counter()
+        logger.info(
+            "[HARDWARE-VOICE][%s][时序] 后台处理任务开始 format=%s "
+            "音频字节=%d 距 dialogue.start=%.3f秒",
+            worker_request_id,
+            worker_audio_format,
+            len(worker_audio_data),
+            worker_started_processing_at - worker_started_at,
+        )
         try:
             result = await _run_hardware_turn(
                 session=worker_session,
@@ -583,6 +788,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             if worker_cancel_event.is_set():
                 return
             total_ms = int((perf_counter() - worker_started_at) * 1000)
+            done_started_at = perf_counter()
             await send_json(
                 {
                     "type": "dialogue.done",
@@ -602,9 +808,29 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 total_ms,
                 result.audio_bytes,
             )
+            logger.info(
+                "[HARDWARE-VOICE][%s][时序] dialogue.done 已发送 "
+                "发送耗时=%.3f秒 总耗时=%.3f秒",
+                worker_request_id,
+                perf_counter() - done_started_at,
+                perf_counter() - worker_started_at,
+            )
         except asyncio.CancelledError:
+            logger.info(
+                "[HARDWARE-VOICE][%s][时序] 本轮被取消 "
+                "总耗时=%.3f秒",
+                worker_request_id,
+                perf_counter() - worker_started_at,
+            )
             return
         except (HardwareVoiceError, HardwareAudioError, BaiduSpeechError) as exc:
+            logger.warning(
+                "[HARDWARE-VOICE][%s][时序] 本轮业务失败 "
+                "总耗时=%.3f秒 error=%s",
+                worker_request_id,
+                perf_counter() - worker_started_at,
+                exc,
+            )
             if not worker_cancel_event.is_set():
                 await send_json(
                     {
@@ -615,7 +841,12 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     }
                 )
         except Exception as exc:
-            logger.exception("[HARDWARE-VOICE][%s] 未预期异常", worker_request_id)
+            logger.exception(
+                "[HARDWARE-VOICE][%s][时序] 未预期异常 "
+                "总耗时=%.3f秒",
+                worker_request_id,
+                perf_counter() - worker_started_at,
+            )
             if not worker_cancel_event.is_set():
                 await send_json(
                     {
@@ -652,6 +883,24 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     )
                     continue
                 received_bytes += len(binary_data)
+                received_frame_count += 1
+                if first_audio_frame_at is None:
+                    first_audio_frame_at = perf_counter()
+                    logger.info(
+                        "[HARDWARE-VOICE][%s][收音] 首个音频帧到达 "
+                        "距 dialogue.start=%.3f秒 本帧字节=%d",
+                        request_id,
+                        first_audio_frame_at - turn_started_at,
+                        len(binary_data),
+                    )
+                elif received_frame_count % 100 == 0:
+                    logger.debug(
+                        "[HARDWARE-VOICE][%s][收音] 已接收音频帧=%d "
+                        "累计字节=%d",
+                        request_id,
+                        received_frame_count,
+                        received_bytes,
+                    )
                 # 连接对端不可信，边接收边限制总大小，避免内存被无限占用。
                 if received_bytes > settings.hardware_voice_max_audio_bytes:
                     # 本轮立即作废；必须等待新的 dialogue.start 才能重新收音。
@@ -743,6 +992,11 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
 
             # ==================== 控制消息：dialogue.start ====================
             if command_type == "dialogue.start":
+                start_received_at = perf_counter()
+                logger.info(
+                    "[HARDWARE-VOICE][%s][时序] 收到 dialogue.start",
+                    request_id,
+                )
                 if turn_task is not None and not turn_task.done():
                     await send_json(
                         {
@@ -809,7 +1063,10 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 # 先做数据库校验再回 ready。设备不存在、禁用或未绑定时，不接收
                 # 后续音频，也不会产生百度/LLM 调用费用。
                 try:
-                    session = await _load_hardware_session(device_sn)
+                    session = await _load_hardware_session(
+                        device_sn,
+                        trace_id=request_id,
+                    )
                 except (
                     HardwareVoiceError,
                     BizError,
@@ -870,6 +1127,8 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 # 所有 start 参数和设备上下文验证成功后，重置上一轮残留状态。
                 audio_parts.clear()
                 received_bytes = 0
+                received_frame_count = 0
+                first_audio_frame_at = None
                 collecting = True
                 turn_started_at = perf_counter()
                 # ready 表示服务端已经准备好接收本轮二进制音频。
@@ -881,11 +1140,13 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     }
                 )
                 logger.info(
-                    "[HARDWARE-VOICE][%s] 开始收音 device_sn=%s format=%s expected=%s",
+                    "[HARDWARE-VOICE][%s][时序] dialogue.start 处理完成，开始收音 "
+                    "device_sn=%s format=%s expected=%s 校验耗时=%.3f秒",
                     request_id,
                     device_sn,
                     audio_format,
                     expected_audio_bytes,
+                    perf_counter() - start_received_at,
                 )
                 continue
 
@@ -909,6 +1170,16 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             audio_data = b"".join(audio_parts)
             # 拼接完成立即释放列表引用，减少大音频在内存中保留的时间。
             audio_parts.clear()
+            audio_upload_finished_at = perf_counter()
+            logger.info(
+                "[HARDWARE-VOICE][%s][收音] 收音结束，开始处理 "
+                "帧数=%d 字节=%d 收音耗时=%.3f秒 距 dialogue.start=%.3f秒",
+                request_id,
+                received_frame_count,
+                len(audio_data),
+                audio_upload_finished_at - turn_started_at,
+                audio_upload_finished_at - turn_started_at,
+            )
             if not audio_data:
                 await send_json(
                     {
@@ -960,7 +1231,9 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     finally:
         # finally 保证正常断线、异常退出、任务取消三种路径都有离线日志。
         logger.info(
-            "[HARDWARE-VOICE][%s] WebSocket 已断开 at=%d",
+            "[HARDWARE-VOICE][%s][连接] WebSocket 已断开 "
+            "连接总时长=%.3f秒 at=%d",
             request_id,
+            perf_counter() - connection_started_at,
             time.time_ns(),
         )

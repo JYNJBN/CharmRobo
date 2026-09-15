@@ -85,8 +85,8 @@ class Settings(BaseSettings):
     )
     baidu_tts_api_key: SecretStr | None = None
     baidu_tts_secret_key: SecretStr | None = None
-    # per=4146 是默认发音人；TTS 输出使用 aue=3 MP3 并降采样到 16 kHz。
-    baidu_tts_per: str = "4146"
+    # per=4196 是默认发音人；TTS 输出使用 aue=3 MP3 并降采样到 16 kHz。
+    baidu_tts_per: str = "4196"
     baidu_tts_speed: int = 6
     baidu_tts_pitch: int = 5
     baidu_tts_volume: int = 5

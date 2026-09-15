@@ -1,9 +1,14 @@
+import logging
+from time import perf_counter
+
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conversation import Conversation
 from app.models.conversation_message import ConversationMessage
 from app.utils.tools import local_now
+
+logger = logging.getLogger(__name__)
 
 
 async def create_conversation(
@@ -87,6 +92,15 @@ async def add_conversation_message(
     ASR/回复的增量片段，避免一次对话产生多条碎片记录。
     """
 
+    started_at = perf_counter()
+    logger.info(
+        "[记忆][消息写入] 开始 conversation_id=%s role=%s source=%s 字数=%d",
+        conversation_id,
+        role,
+        source,
+        len(content),
+    )
+
     conversation = await get_conversation_by_id(db, conversation_id)
     if conversation is None:
         raise ValueError(f"会话不存在：{conversation_id}")
@@ -103,6 +117,14 @@ async def add_conversation_message(
 
     db.add(message)
     await db.commit()
+    logger.info(
+        "[记忆][消息写入] 完成 conversation_id=%s role=%s "
+        "消息总数=%s 耗时=%.3f秒",
+        conversation_id,
+        role,
+        conversation.message_count,
+        perf_counter() - started_at,
+    )
 
 
 async def get_recent_messages(
@@ -119,6 +141,14 @@ async def get_recent_messages(
     role/content 的行为。
     """
 
+    started_at = perf_counter()
+    logger.info(
+        "[记忆][短期读取] 开始 conversation_id=%s limit=%s "
+        "包含时间戳=%s",
+        conversation_id,
+        limit,
+        include_timestamps,
+    )
     result = await db.execute(
         select(ConversationMessage)
         .where(ConversationMessage.conversation_id == conversation_id)
@@ -141,6 +171,13 @@ async def get_recent_messages(
             # Seeduplex dialog_context 使用 Unix 毫秒时间戳。
             item["timestamp"] = int(message.created_at.timestamp() * 1000)
         result_messages.append(item)
+    logger.info(
+        "[记忆][短期读取] 完成 conversation_id=%s 条数=%d "
+        "耗时=%.3f秒",
+        conversation_id,
+        len(result_messages),
+        perf_counter() - started_at,
+    )
     return result_messages
 
 

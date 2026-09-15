@@ -15,7 +15,7 @@ VOICE_LABELS = {
 # 百度流式 TTS 的发音人编号。数据库仍保存中立的 voice key，避免把某一家
 # 厂商的 per/voice_id 直接写进 Agent；不同供应商继续使用各自的转换函数。
 BAIDU_TTS_PER = {
-    "female_gentle": "4146",
+    "female_gentle": "4196",
     "male_steady": "4179",
     "female_sweet": "6567",
 }
