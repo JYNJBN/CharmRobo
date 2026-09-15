@@ -63,7 +63,7 @@ from app.services.conversation_service import (
 )
 from app.services.device_service import get_active_owner_binding, get_device_by_sn
 from app.services.hardware_actions import hardware_action_service
-from app.services.model_service import describe_model, resolve_model
+from app.services.model_service import resolve_model
 from app.services.voice_service import resolve_baidu_tts_per
 from app.utils.tools import local_now
 
@@ -258,22 +258,31 @@ async def _load_hardware_session(
         )
 
         # 将数据库里的 model_key 解析成现有 LLM 层可直接使用的模型配置。
+        # 这里只是拿一份基线配置，硬件链路随后会整体覆盖成专属模型。
         model = resolve_model(agent.model_key)
-        model_label = describe_model(agent.model_key)
-        if model["provider"] == "ark":
-            # 硬件路线固定使用旧 server 验证过的低延迟豆包模型，并明确关闭思考。
-            # 这里复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
-            model = {
-                **model,
-                "model_id": settings.hardware_doubao_model,
-                "thinking_type": "disabled",
-            }
-            logger.info(
-                "[HARDWARE-VOICE][%s][会话] 硬件模型已固定 "
-                "model=%s thinking=disabled",
-                trace_id,
-                settings.hardware_doubao_model,
-            )
+        # 硬件链路固定走火山方舟 + 硬件专属模型，故意不看智能体的 model_key：
+        # 否则用户在智能体里把模型切成千问/豆包后，硬件链路会静默跟着切换。
+        # 复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
+        model = {
+            **model,
+            "provider": "ark",
+            "api_key": settings.ark_api_key,
+            "base_url": settings.ark_base_url,
+            "model_id": settings.hardware_llm_model,
+            # DeepSeek-V4.1-Flash 默认开深度思考（high），会先产出一大段思考再
+            # 回答：对语音播报既抬高首字延迟，又会吃掉 max_tokens。必须显式关闭。
+            "thinking_type": "disabled",
+        }
+        # 系统提示词里的模型名必须跟真实调用的模型一致，否则用户问
+        # "你现在用什么模型" 会得到智能体里选的旧模型名。
+        model_label = settings.hardware_llm_label
+        logger.info(
+            "[HARDWARE-VOICE][%s][会话] 硬件模型已固定 "
+            "model=%s label=%s thinking=disabled",
+            trace_id,
+            settings.hardware_llm_model,
+            model_label,
+        )
 
         # 会话按当前智能体复用。切换智能体后会得到另一条 conversation，历史不会
         # 混到旧智能体中。
