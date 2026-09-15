@@ -675,6 +675,7 @@ async def _run_hardware_turn(
             agent_id=session.agent_id,
             user_id=session.user_id,
             trace_id=request_id,
+            model=session.model,
         )
     )
     logger.info(

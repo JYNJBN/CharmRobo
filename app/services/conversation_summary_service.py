@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.ai import stream_chat
 from app.models import ConversationMessage, ConversationSummary
+from app.schemas.Model import ModelRegistryObject
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ async def generate_conversation_summary(
         limit: int = 20,
         trace_id: str = "summary",
         agent_id: int | None = None,
+        model: ModelRegistryObject | None = None,
 ) -> ConversationSummary | None:
     """生成一批未摘要消息的摘要。"""
 
@@ -166,6 +168,7 @@ async def generate_conversation_summary(
                     "你只负责生成准确、简洁、可用于长期记忆检索的中文摘要。"
                     "不要回答用户问题，不要编造对话中没有的信息。"
             ),
+            model=model,
     ):
         summary_parts.append(delta)
 

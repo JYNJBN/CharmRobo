@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.integrations.embedding import embed_text
 from app.integrations.milvus import upsert_summary
+from app.schemas.Model import ModelRegistryObject
 from app.services.conversation_summary_service import (
     generate_conversation_summary,
     get_latest_summary_end_message_id,
@@ -28,6 +29,7 @@ async def summarize_conversation_in_background(
     user_id: int | None,
     trace_id: str,
     agent_id: int | None = None,
+    model: ModelRegistryObject | None = None,
 ) -> None:
     """后台生成会话摘要，并把摘要向量写入 Milvus。
 
@@ -78,6 +80,7 @@ async def summarize_conversation_in_background(
                 last_covered_message_id=last_covered_message_id,
                 limit=settings.summary_batch_messages,
                 trace_id=f"{trace_id}-summary",
+                model=model,
             )
             summary_elapsed = asyncio.get_running_loop().time() - summary_started_at
 
