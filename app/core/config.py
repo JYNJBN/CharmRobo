@@ -1,4 +1,4 @@
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,14 +40,9 @@ class Settings(BaseSettings):
     # 硬件语音链路固定使用的大模型，不随智能体的 model_key 变化，也不影响
     # 小程序端到端模型配置。当前走火山方舟的 DeepSeek-V4.1-Flash（深度思考
     # 模型，调用处会显式 thinking=disabled）。
-    # 兼容旧变量名 HARDWARE_DOUBAO_MODEL：只配了旧变量时仍然生效。
-    hardware_llm_model: str = Field(
-        default="deepseek-v4-1-flash-260910",
-        validation_alias=AliasChoices(
-            "hardware_llm_model",
-            "hardware_doubao_model",
-        ),
-    )
+    # 注意：这里刻意**不做** HARDWARE_DOUBAO_MODEL 旧变量名兼容。若服务器 .env
+    # 里还留着旧变量，让它被忽略才对——否则旧值会盖掉新模型，表现为"改了没生效"。
+    hardware_llm_model: str = "deepseek-v4-1-flash-260910"
     # 写进系统提示词的模型名。用户问"你是什么模型"时模型会照这个回答，
     # 换硬件模型时这里要同步改，否则会答成上一代模型。
     hardware_llm_label: str = "DeepSeek-V4.1-Flash"
