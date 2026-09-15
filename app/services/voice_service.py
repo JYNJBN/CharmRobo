@@ -8,8 +8,9 @@ VOICE_ALIAS = {
 
 VOICE_LABELS = {
     "female_gentle": "度禧禧·阳光女声",
-    "male_steady": "度泽言·温暖男声",
-    "female_sweet": "度小柔·温柔女声",
+    # 暂时只开放百度 4196 对应的音色；下面两个旧选项先不展示。
+    # "male_steady": "度泽言·温暖男声",
+    # "female_sweet": "度小柔·温柔女声",
 }
 
 # 百度流式 TTS 的发音人编号。数据库仍保存中立的 voice key，避免把某一家
