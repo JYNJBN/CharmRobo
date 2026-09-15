@@ -20,13 +20,10 @@
 from __future__ import annotations
 
 import asyncio
-import audioop
 import logging
 import math
 import struct
 import subprocess
-
-import lameenc
 
 
 class HardwareAudioError(RuntimeError):
@@ -372,126 +369,3 @@ async def decode_audio_container_to_pcm_async(
         data,
         sample_rate=sample_rate,
     )
-
-
-# ==================== 下行 MP3 编码（阿里链路专用） ====================
-# 百度 TTS 直接返回 16 kHz MP3，而阿里 Qwen Audio 的语音输出固定是
-# 24 kHz/16-bit/单声道裸 PCM。ESP32 固件现有的解码逻辑只认 16 kHz MP3，
-# 所以这条链路必须把 PCM 实时编码成 MP3。
-#
-# 为什么不用本项目已经在用的 FFmpeg：mp3 封装器在管道输出时不支持中途吐
-# 数据，实测无论加 -flush_packets 1 / -avioflags direct / -write_xing 0
-# 还是 -write_id3v1 0，输出都会全部堆积到 stdin 关闭之后才出现，首包延迟
-# 会从"说完话就开始播"退化成"整段回答生成完才出声"。因此改用 lameenc
-# （libmp3lame 的绑定），它提供真正的增量 encode/flush 接口。
-
-DEFAULT_MP3_INPUT_RATE = 24000
-DEFAULT_MP3_OUTPUT_RATE = 16000
-DEFAULT_MP3_BITRATE = 48
-DEFAULT_MP3_QUALITY = 2
-
-
-class StreamingMp3Encoder:
-    """把连续写入的裸 PCM 增量编码成 MP3 分片。
-
-    典型用法::
-
-        encoder = StreamingMp3Encoder()
-        for pcm in upstream_pcm_chunks:
-            for mp3 in encoder.feed(pcm):
-                await send_bytes(mp3)
-        for mp3 in encoder.finish():
-            await send_bytes(mp3)
-
-    没有子进程也没有管道，所以不存在"缓冲攒够才输出"的问题：
-
-    - ``lameenc`` 每凑满一个 MP3 帧就返回一段字节，不足一帧的尾部留在库
-      内部，等下一次 ``feed`` 或 ``finish`` 再交付，首包延迟只剩编码器本身
-      约一帧的固有延迟（16 kHz 下约 72 ms）；
-    - 24k 降到 16k 用标准库 ``audioop.ratecv``，它通过 ``state`` 参数把上一
-      个分片的尾巴带到下一个分片，因此可以逐片处理而不会在分片边界上产生
-      不连续（否则听感上会是周期性杂音）。
-
-    ``feed`` / ``finish`` 是同步方法：单片 50 ms 音频的 MP3 编码耗时在亚毫秒
-    量级，不值得为它承担线程池切换开销。若将来要把整段长音频一次性塞进来，
-    调用方应改用 ``asyncio.to_thread`` 包裹。
-    """
-
-    def __init__(
-        self,
-        *,
-        input_rate: int = DEFAULT_MP3_INPUT_RATE,
-        output_rate: int = DEFAULT_MP3_OUTPUT_RATE,
-        bitrate: int = DEFAULT_MP3_BITRATE,
-        quality: int = DEFAULT_MP3_QUALITY,
-    ) -> None:
-        self._input_rate = input_rate
-        self._output_rate = output_rate
-        # 用 CBR 而不是 VBR：固件播放器按固定码率推算缓冲更稳，字节流长度
-        # 也更好预期。
-        encoder = lameenc.Encoder()
-        encoder.set_bit_rate(bitrate)
-        encoder.set_in_sample_rate(output_rate)
-        encoder.set_channels(1)
-        encoder.set_quality(quality)
-        self._encoder = encoder
-        # audioop.ratecv 的跨分片状态，必须逐片传递，不能每片都重置。
-        self._resample_state: object = None
-        self._finished = False
-        # 供路由侧统计和排查：累计编码出的 MP3 分片数与字节数。
-        self.encoded_bytes = 0
-        self.chunk_count = 0
-
-    def feed(self, pcm: bytes) -> list[bytes]:
-        """写入一片 24k PCM，返回本次已编码完成的 MP3 分片。
-
-        返回空列表是正常情况：说明还没凑满一个 MP3 帧，数据留在编码器内部，
-        会在后续 ``feed`` 或 ``finish`` 中交付，不会丢失。
-        """
-
-        if self._finished or not pcm:
-            return []
-        payload = self._resample(pcm)
-        if not payload:
-            return []
-        data = self._encoder.encode(payload)
-        if not data:
-            return []
-        self.encoded_bytes += len(data)
-        self.chunk_count += 1
-        return [data]
-
-    def finish(self) -> list[bytes]:
-        """冲刷编码器内部残留，返回最后一段 MP3。
-
-        必须调用，否则最后一帧（通常不足一个完整帧）会被丢掉，回答末尾的
-        几个字就没有声音。
-        """
-
-        if self._finished:
-            return []
-        self._finished = True
-        data = self._encoder.flush()
-        if not data:
-            return []
-        self.encoded_bytes += len(data)
-        self.chunk_count += 1
-        return [data]
-
-    def _resample(self, pcm: bytes) -> bytes:
-        """24k 降到 16k；两侧采样率相同时直接透传。"""
-
-        if self._input_rate == self._output_rate:
-            return pcm
-        # 参数依次是：数据、样本宽度（2 字节 = 16 bit）、声道数、输入采样率、
-        # 输出采样率、上一次调用留下的状态。返回 (转换后数据, 新状态)。
-        resampled, self._resample_state = audioop.ratecv(
-            pcm,
-            2,
-            1,
-            self._input_rate,
-            self._output_rate,
-            self._resample_state,
-        )
-        return resampled
-
