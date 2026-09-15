@@ -24,6 +24,17 @@ SYSTEM_INSTRUCTIONS = (
 MAX_OUTPUT_TOKENS = 300
 
 
+def _thinking_extra_body(
+        model_config: ModelRegistryObject,
+) -> dict[str, object] | None:
+    """按模型配置生成 OpenAI 兼容客户端的厂商扩展参数。"""
+
+    thinking_type = model_config.get("thinking_type")
+    if not thinking_type:
+        return None
+    return {"thinking": {"type": thinking_type}}
+
+
 def build_instructions(
         model_label: str | None = None,
         persona: str | None = None,
@@ -115,10 +126,12 @@ async def chat(
     started_at = perf_counter()
 
     try:
+        extra_body = _thinking_extra_body(model_config)
         response = await client.chat.completions.create(
             model=model_config["model_id"],
             messages=messages,
             max_tokens=MAX_OUTPUT_TOKENS,
+            **({"extra_body": extra_body} if extra_body else {}),
         )
 
         answer = response.choices[0].message.content or (
@@ -175,11 +188,13 @@ async def stream_chat(
 
     try:
         create_started_at = perf_counter()
+        extra_body = _thinking_extra_body(model_config)
         stream = await client.chat.completions.create(
             model=model_config["model_id"],
             messages=llm_messages,
             max_tokens=MAX_OUTPUT_TOKENS,
             stream=True,
+            **({"extra_body": extra_body} if extra_body else {}),
         )
         logger.info(
             "[LLM][%s] Chat Completions 流已建立 provider=%s model=%s elapsed=%.3fs",

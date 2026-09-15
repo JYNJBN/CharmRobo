@@ -17,6 +17,7 @@ def _build_model_registry() -> dict[str, ModelRegistryObject]:
             "base_url": settings.ark_base_url,
             "model_id": settings.ark_doubao_model,
             "protocol": "chat_completions",
+            "thinking_type": None,
         },
     }
 
@@ -27,6 +28,7 @@ def _build_model_registry() -> dict[str, ModelRegistryObject]:
             "base_url": settings.ark_base_url,
             "model_id": settings.ark_deepseek_model,
             "protocol": "chat_completions",
+            "thinking_type": None,
         }
 
     if settings.qwen_api_key and settings.qwen_model:
@@ -36,6 +38,7 @@ def _build_model_registry() -> dict[str, ModelRegistryObject]:
             "base_url": settings.qwen_base_url,
             "model_id": settings.qwen_model,
             "protocol": "chat_completions",
+            "thinking_type": None,
         }
 
     return registry

@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     ark_api_key: SecretStr
     ark_deepseek_model: str | None = None
     ark_doubao_model: str
+    # 硬件普通聊天固定使用低延迟豆包模型；不影响小程序端到端模型配置。
+    hardware_doubao_model: str = "doubao-seed-2-0-mini-260428"
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str = (
         "https://dashscope.aliyuncs.com/compatible-mode/v1"

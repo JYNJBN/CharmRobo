@@ -260,6 +260,20 @@ async def _load_hardware_session(
         # 将数据库里的 model_key 解析成现有 LLM 层可直接使用的模型配置。
         model = resolve_model(agent.model_key)
         model_label = describe_model(agent.model_key)
+        if model["provider"] == "ark":
+            # 硬件路线固定使用旧 server 验证过的低延迟豆包模型，并明确关闭思考。
+            # 这里复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
+            model = {
+                **model,
+                "model_id": settings.hardware_doubao_model,
+                "thinking_type": "disabled",
+            }
+            logger.info(
+                "[HARDWARE-VOICE][%s][会话] 硬件模型已固定 "
+                "model=%s thinking=disabled",
+                trace_id,
+                settings.hardware_doubao_model,
+            )
 
         # 会话按当前智能体复用。切换智能体后会得到另一条 conversation，历史不会
         # 混到旧智能体中。
