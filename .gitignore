@@ -6,6 +6,10 @@ dist/
 wheels/
 *.egg-info
 
+tests/
+
+docs/
+
 # Virtual environments
 .venv
 
@@ -23,3 +27,4 @@ infra/milvus/volumes/
 
 # 原始音乐素材仅在本地转换；线上运行只需要已归一化的 music/。
 music_raw/
+
