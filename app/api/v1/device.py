@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, HTTPException, status
 
 from app.api.dependencies import (
@@ -17,10 +19,13 @@ from app.schemas.user import UpdateDeviceModelResponse, UpdateDeviceModelRequest
 from app.services.device_binding_service import create_bind_ticket
 from app.services.device_service import (
     bootstrap_device,
+    ensure_device_bindable,
     get_devices_by_user_id,
     unbind_device_for_user,
     update_device_model_for_user,
 )
+
+logger = logging.getLogger(__name__)
 
 # 小程序调用的接口，需要用户 JWT。
 user_device_router = APIRouter(
@@ -41,12 +46,29 @@ hardware_device_router = APIRouter(
 )
 async def create_ticket_api(
         data: CreateTicketRequest,
+        db: DbSession,
         redis: RedisClient,
         current_user_id: CurrentUserId,
 ) -> ApiResponse[CreateTicketResponse]:
     """
     小程序申请一次性绑定码。
+
+    发码前先确认设备没被其他账号占着：抢绑最终也会被 bootstrap 拒绝，
+    但那个 409 只会回到设备固件手里，小程序拿不到可读原因，用户只能
+    看到一句通用的失败提示。在这里提前拦下，错误就直接回到小程序。
     """
+
+    try:
+        await ensure_device_bindable(
+            db=db,
+            user_id=current_user_id,
+            device_sn=data.device_sn,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
     ticket = await create_bind_ticket(
         redis=redis,
@@ -86,6 +108,16 @@ async def bootstrap_device_api(
         )
 
     except ValueError as exc:
+        # 失败时把硬件上报的三个标识一起打出来：排查设备身份/固件版本
+        # 相关问题时，这是唯一能确认"设备到底报了什么"的地方。
+        logger.warning(
+            "设备 bootstrap 失败 device_sn=%s product_key=%s firmware_version=%s hardware_version=%s 原因=%s",
+            data.device_sn,
+            data.product_key,
+            data.firmware_version,
+            data.hardware_version,
+            exc,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),

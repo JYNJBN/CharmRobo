@@ -55,6 +55,48 @@ async def get_active_owner_binding(
     return result.scalars().first()
 
 
+async def ensure_device_bindable(
+        db: AsyncSession,
+        user_id: int,
+        device_sn: str,
+) -> None:
+    """
+    发放绑定凭证前的预检查：设备已被其他用户绑定就直接拒绝。
+
+    为什么要有这一步：
+        bootstrap 接口也能拦截抢绑，但那个接口是设备调的，
+        HTTP 409 的 detail 只会到设备固件手里。固件目前只回一个
+        通用失败标识（如 bind_failed:server_error），小程序拿不到
+        可读原因，用户要等整条 BLE 配网走完才看到一个 "fail xxx"。
+        在这里提前拦下来，错误就由小程序自己的请求返回。
+
+    放行的情况：设备还没入库（全新设备）、设备没有有效 owner、
+    设备就属于当前用户（重复配网）。
+    """
+
+    device = await get_device_by_sn(db, device_sn)
+    if device is None:
+        return
+
+    device_id = int(device.id)
+
+    active_owner = await get_active_owner_binding(db, device_id)
+    if active_owner is None:
+        return
+
+    if int(active_owner.user_id) == int(user_id):
+        return
+
+    logger.warning(
+        "拒绝发放绑定码：设备已有其他用户 device_sn=%s device_id=%s requested_user_id=%s owner_user_id=%s",
+        device_sn,
+        device_id,
+        user_id,
+        active_owner.user_id,
+    )
+    raise ValueError("该设备已被其他账号绑定，请先在原账号中移除设备")
+
+
 async def get_user_device_binding(
         db: AsyncSession,
         user_id: int,
@@ -85,9 +127,11 @@ async def bootstrap_device(
     """
 
     logger.info(
-        "设备绑定请求开始 device_sn=%s product_key=%s",
+        "设备绑定请求开始 device_sn=%s product_key=%s firmware_version=%s hardware_version=%s",
         data.device_sn,
         data.product_key,
+        data.firmware_version,
+        data.hardware_version,
     )
 
     # ================================================================
