@@ -62,6 +62,12 @@ class SentenceSplitter:
         return [remainder] if remainder else []
 
 
+def _is_blank_utterance(text: str | None) -> bool:
+    """判断是否为有实际内容输入"""
+    _MEANINGLESS_RE = re.compile(r"[\s，。！？、,.!?~～…—\\-]+")
+    return not _MEANINGLESS_RE.sub("", text or "")
+
+
 async def run_turn(
         user_text: str,
         history: list[dict[str, str]],
@@ -98,7 +104,18 @@ async def run_turn(
     # 3. 落库：本轮结束后调用 add_conversation_message(...) 保存，
     #    或在此统一写记忆，避免散落在各路由。
     """
+    EMPTY_UTTERANCE_REPLY = "我没听清，你再说一遍好吗？"
 
+    if _is_blank_utterance(user_text):
+        # 空输入交给 LLM 会得到一句无关寒暄，看起来像"设备自己乱说话"；
+        # 顺带也避免 Embedding 因空文本抛 ValueError。直接回固定话术。
+        logger.info(
+            "[对话][兜底][%s] 用户输入为空，返回固定话术 conversation_id=%s",
+            trace_id,
+            conversation_id,
+        )
+        yield EMPTY_UTTERANCE_REPLY
+        return
     # 拼装本轮 messages：历史在前，用户本轮在后。
     messages = [
         *history,
