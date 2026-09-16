@@ -179,12 +179,27 @@ class LocalMusicLibrary:
         self.config = config
         self.tracks = self._scan(Path(config.music_dir))
 
-    def select(self, text: str) -> MusicSelection | None:
+    def select(
+        self, text: str, *, require_trigger: bool = True
+    ) -> MusicSelection | None:
+        """按文本匹配本地曲库。
+
+        require_trigger=False 是给工具路由用的：路由已经判定「这是听歌请求」，
+        此时用户可能只报了歌名或用了词表外的说法（如「橙子那首歌」「来一下
+        太阳之子」），句子里没有「播放/想听」这类触发词，不该再拦。
+        关键词路径必须保持 require_trigger=True —— 它是"缓存"，如果连触发词都
+        不要求，「外面下雪了吗」这种句子里恰好出现的歌名会被误播。
+        """
+
         if not self.config.music_enable:
             return None
         raw = (text or "").strip()
         compact = re.sub(r"[，。！？?、\s]", "", raw)
-        if not compact or not any(word in compact for word in _MUSIC_TRIGGER_WORDS):
+        if not compact:
+            return None
+        if require_trigger and not any(
+            word in compact for word in _MUSIC_TRIGGER_WORDS
+        ):
             return None
         query = compact
         for word in sorted(_MUSIC_COMMAND_WORDS, key=len, reverse=True):
@@ -192,6 +207,8 @@ class LocalMusicLibrary:
         query = (
             query.replace("这首歌", "")
             .replace("这首", "")
+            .replace("那首歌", "")
+            .replace("那首", "")
             .replace("歌曲", "歌")
             .replace("音乐", "歌")
         )
@@ -324,10 +341,14 @@ class WeatherService:
     def _parse(self, text: str) -> WeatherIntent | None:
         raw = text or ""
         if not any(word in raw for word in _WEATHER_WORDS):
+            # 没命中天气词时，只有「整句本身就是一个天气现象词」（如单独一句
+            # “晴天”）才当作天气查询。
+            # 这里曾经写成 compact in CONDITIONS or not any(...) → return None，
+            # 布尔逻辑正好相反，导致：单说“晴天”反而被排除，而含现象词的更长
+            # 句子（如歌名“太阳之子”命中“太阳”）却被判成天气 —— 曲库里名字带
+            # 这些词的音乐因此永远播不出来，用户问歌名得到的是天气播报。
             compact = re.sub(r"[，。！？?、\s]", "", raw)
-            if compact in _WEATHER_CONDITION_WORDS or not any(
-                word in raw for word in _WEATHER_CONDITION_WORDS
-            ):
+            if compact not in _WEATHER_CONDITION_WORDS:
                 return None
         day_offset = 2 if "后天" in raw else 1 if "明天" in raw else 0
         city = next(
@@ -373,11 +394,52 @@ class HardwareActionService:
             return ActionResult("weather", weather)
         if not self.config.tool_router_enable:
             return None
-        decision = await self._tool_decide(text, model)
+        # 两个能力开关都关着时，路由能判出的三个 action 最终都会回落闲聊
+        # （chat → None；music → 下面的 music_enable 守卫；weather → 下面的
+        # weather_enable 守卫），所以这次 LLM 调用纯属浪费。提前短路，省掉
+        # 每轮约 7 秒的判断开销。行为与不短路完全一致，只是不再白花一次请求。
+        if not self.config.music_enable and not self.config.weather_enable:
+            logger.info(
+                "音乐与天气能力都未开启，工具路由无可用动作，跳过本轮判断 text=%s",
+                text,
+            )
+            return None
+        # 路由只是「要不要调工具」的判断，失败必须能降级，绝不能阻塞对话。
+        # 这里给它加硬超时：超时或结果不可解析都直接 return None，交给上层走
+        # run_turn 闲聊。用户侧最坏也只是少了一次工具调用，而不是干等十几秒。
+        try:
+            decision = await asyncio.wait_for(
+                self._tool_decide(text, model),
+                timeout=self.config.tool_router_timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "工具路由超时（%.1f 秒），本轮回落闲聊 text=%s",
+                self.config.tool_router_timeout_sec,
+                text,
+            )
+            return None
         if decision is None:
             return None
         if decision.action == "music":
-            music = self.music.select(decision.song_query or "播放一首歌")
+            # 音乐开关关掉时 select() 会直接返回 None。这时不能再落到下面的
+            # music_not_found 兜底，否则会把「功能未开启」谎报成「曲库里没有
+            # 这首歌」——用户听到的是"我这儿没这首歌"，而曲库其实是满的。
+            # 直接回落闲聊，让用户得到一个正常的回应。
+            if not self.config.music_enable:
+                logger.info("音乐功能未开启，路由结果回落闲聊 text=%s", text)
+                return None
+            if decision.song_query:
+                # 路由已经确认这是听歌请求，歌名不再过触发词闸门：用户很可能
+                # 只说「橙子那首歌」「来一下太阳之子」，句子里没有「播放/想听」。
+                # 不放开的话，曲库里明明有《橙子》也会落到 music_not_found，
+                # 又变成谎报"曲库没有"。
+                music = self.music.select(
+                    decision.song_query, require_trigger=False
+                )
+            else:
+                # 路由判了 music 但没给歌名 → 当作"随便放一首"，沿用原路径。
+                music = self.music.select("播放一首歌")
             if music and music.track:
                 return ActionResult(
                     "music",
@@ -395,6 +457,14 @@ class HardwareActionService:
                 music.message if music else "本地曲库里还没有可播放的音乐。",
             )
         if decision.action == "weather":
+            # 与 music 分支保持一致的语义：功能开关关掉就回落闲聊。
+            # 这道守卫必须加在这里 —— answer_intent() 自己不检查 weather_enable
+            # （它只是"按已解析好的意图去查"的执行层，另一个调用方 answer() 已经
+            # 在入口查过了）。少了这道判断，关掉天气开关后路由路径照样会真查真播，
+            # 同一个开关在两条路径上表现不一致，调用方无法预测。
+            if not self.config.weather_enable:
+                logger.info("天气功能未开启，路由结果回落闲聊 text=%s", text)
+                return None
             try:
                 answer = await self.weather.answer_intent(
                     WeatherIntent(
@@ -411,13 +481,31 @@ class HardwareActionService:
     async def _tool_decide(
         self, text: str, model: ModelRegistryObject
     ) -> ToolDecision | None:
+        # 字段声明必须与下面的解析代码一一对应。曾经这里只声明了 action /
+        # confidence / song_query / random_play 四个字段，却在解析时读 city /
+        # day_offset / forecast，导致模型永远不返回这三个字段，路由判出的天气
+        # 问题一律落到默认城市和「今天」。
         prompt = (
             "你是语音助手动作路由器，只输出 JSON，不回答用户。格式："
-            '{"action":"chat|weather|music","confidence":0.0,"song_query":"","random_play":false}. '
+            '{"action":"chat|weather|music","confidence":0.0,'
+            '"city":"城市名，没提到就填空字符串","day_offset":0,'
+            '"forecast":false,"song_query":"","random_play":false}. '
+            "day_offset：今天=0，明天=1，后天=2；forecast：问未来天气为 true。"
             "用户想听歌/播放音乐选 music；天气问题选 weather；其它选 chat。"
         )
         try:
-            raw = await chat(text, instructions=prompt, model=model)
+            # max_retries=0：SDK 默认会重试两次，一次超时被放大成两次，用户侧
+            # 延迟直接翻倍。路由判断失败本身可以降级，重试没有收益。
+            # temperature=0：路由是分类任务，不设温度同一句话会给出不同 action。
+            # 实测「给我放橙子」连跑 4 次只有 1 次判 music，其余判 chat —— 用户
+            # 侧表现为"时好时坏"，且无法复现排查。分类任务必须固定温度。
+            raw = await chat(
+                text,
+                instructions=prompt,
+                model=model,
+                max_retries=0,
+                temperature=0,
+            )
             match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
             payload = json.loads(match.group(0) if match else raw)
             action = str(payload.get("action") or "chat").lower()

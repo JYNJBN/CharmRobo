@@ -62,8 +62,20 @@ def build_instructions(
     return "\n".join(parts)
 
 
-def get_model_client(model_config: ModelRegistryObject) -> AsyncOpenAI:
-    """根据模型配置创建 OpenAI 兼容客户端。"""
+def get_model_client(
+        model_config: ModelRegistryObject,
+        *,
+        max_retries: int | None = None,
+) -> AsyncOpenAI:
+    """根据模型配置创建 OpenAI 兼容客户端。
+
+    max_retries 默认 None，表示沿用 openai SDK 自身的默认值（也就是会自动
+    重试两次），因此既有的 chat / stream_chat 行为完全不变。只有「调用失败
+    就降级」的场景才会显式传 0，例如工具路由：SDK 默认重试会把一次超时放大
+    成两次，用户侧整体延迟翻倍，而路由判断本来就允许失败后回落闲聊，重试
+    没有任何收益。超时统一由调用方用 asyncio.wait_for 在外面兜，这样能覆盖
+    整个路由步骤（建客户端、发请求、解析 JSON），而不只是单次 HTTP 请求。
+    """
 
     api_key = model_config["api_key"]
     if not api_key.get_secret_value():
@@ -72,9 +84,14 @@ def get_model_client(model_config: ModelRegistryObject) -> AsyncOpenAI:
             detail=f"未配置 {model_config['provider']} API Key",
         )
 
+    overrides: dict[str, object] = {}
+    if max_retries is not None:
+        overrides["max_retries"] = max_retries
+
     return AsyncOpenAI(
         api_key=api_key.get_secret_value(),
         base_url=model_config["base_url"].rstrip("/"),
+        **overrides,
     )
 
 
@@ -106,11 +123,24 @@ async def chat(
         trace_id: str = "standalone",
         instructions: str = SYSTEM_INSTRUCTIONS,
         model: ModelRegistryObject | None = None,
+        *,
+        max_retries: int | None = None,
+        temperature: float | None = None,
 ) -> str:
-    """使用 Chat Completions 进行一次性文字对话。"""
+    """使用 Chat Completions 进行一次性文字对话。
+
+    max_retries / temperature 默认都是 None，沿用 SDK 与厂商的默认行为；它们是
+    后加的关键词参数，不影响任何既有调用方。
+
+    - `max_retries=0`：工具路由用。SDK 默认重试两次，一次超时会被放大成两次，
+      用户侧延迟翻倍；而路由失败本来就可以降级，重试没有收益。
+    - `temperature=0`：工具路由用。路由是**分类任务**（chat / music / weather），
+      不设温度时同一句话多次调用会给出不同 action，表现为"时好时坏"。实测
+      「给我放橙子」4 次里只有 1 次判 music，其余判 chat。分类任务要可复现。
+    """
 
     model_config = model or resolve_model(None)
-    client = get_model_client(model_config)
+    client = get_model_client(model_config, max_retries=max_retries)
     messages = _build_messages(
         text=text,
         messages=None,
@@ -131,6 +161,7 @@ async def chat(
             model=model_config["model_id"],
             messages=messages,
             max_tokens=MAX_OUTPUT_TOKENS,
+            **({"temperature": temperature} if temperature is not None else {}),
             **({"extra_body": extra_body} if extra_body else {}),
         )
 

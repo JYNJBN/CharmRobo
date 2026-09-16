@@ -240,6 +240,15 @@ async def load_e2e_context(
         )
 
         if owner_binding is None:
+            # 这种情况在日志里表现为"一直在刷的异常"，但异常信息本身不含设备标识，
+            # 所以这里把 device_sn / device_id 一并打出来，直接定位是哪台设备。
+            logger.warning(
+                "[E2E][%s] 设备没有有效 owner 绑定，拒绝建立会话 "
+                "device_sn=%s device_id=%s（该设备可能从未完成配网绑定，或已被解绑）",
+                connection_id,
+                device_sn,
+                device.id,
+            )
             raise VolcengineDuplexError("设备尚未绑定用户")
 
         # 如果设备还没有 active_agent，这里会创建默认副本
@@ -602,10 +611,13 @@ async def stream_voice_end_to_end(client: WebSocket) -> None:
 
     try:
         session_command = await asyncio.wait_for(client.receive_json(), timeout=15)
-        logger.debug(
-            "[E2E][%s] 收到会话开始命令 type=%s",
+        # 这一条必须留在 INFO：默认 LOG_LEVEL=INFO 时 debug 看不到，而它是
+        # "小程序到底有没有发 session_start、几秒内发的"的唯一证据。
+        logger.info(
+            "[E2E][%s] 收到会话开始命令 type=%s 等待=%.2f秒",
             connection_id,
             session_command.get("type"),
+            perf_counter() - connection_started_at,
         )
         if session_command.get("type") != "session_start":
             raise VolcengineDuplexError("第一条消息必须是 session_start")
@@ -614,6 +626,10 @@ async def stream_voice_end_to_end(client: WebSocket) -> None:
         device_sn = str(session_command.get("device_sn") or "").strip()
         if not device_sn:
             raise VolcengineDuplexError("缺少 device_sn")
+        # 必须打出来：后面 load_e2e_context 可能因为"设备尚未绑定用户"之类的
+        # 原因直接把这一轮打回，而那类异常信息里不含 device_sn，日志里会出现
+        # 一堆看不出是哪台设备的报错，没法排查。
+        logger.info("[E2E][%s] 会话开始 device_sn=%s", connection_id, device_sn)
         # 每次建立新的 client/upstream 连接都重新加载数据库配置；这也是
         # 重连恢复短期记忆、应用新 Agent 人设和应用新音色的入口。
         context = await load_e2e_context(

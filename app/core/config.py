@@ -103,6 +103,21 @@ class Settings(BaseSettings):
     # 单轮网络上传总量上限，同时限制 PCM/Speex，防止异常设备无限占用内存。
     hardware_voice_max_audio_bytes: int = 2 * 1024 * 1024
     # 软件动作层：默认关闭，打开后才扫描本地音乐、请求天气或调用 LLM 工具路由。
+    #
+    # ★ 开关语义：music_enable / weather_enable 是「能力总开关」，不只是关键词开关。
+    #   关闭后该能力在【两条路径】上都不可用 —— 关键词路径和 LLM 路由路径都会
+    #   回落闲聊。enable=False 时不要指望路由还能用这个能力。
+    #   （历史坑：answer_intent() 曾不检查 weather_enable，导致天气开关关掉后
+    #    路由路径照样真查真播，同一个开关在两条路径上表现不一致。）
+    #   关闭时也不会谎报成资源不存在 —— 不会说「本地曲库里还没有这首歌」，
+    #   而是正常走闲聊。
+    #
+    # ★ 推荐配置：想要「让 AI 判断天气」就开 weather_enable + tool_router_enable。
+    #   关键词层负责「XX天气/会不会下雨」这类显式问句（_CITY_IDS 能精确识别 16 个
+    #   城市、_parse 能提日期），路由层负责「拿伞/下雪/穿外套」这类不在词表里的
+    #   口语说法。两层互补，比只开路由更准。
+    #   两个能力开关如果都关着，工具路由就没有任何可用动作了，resolve() 会直接
+    #   短路跳过那次 LLM 调用（省掉每轮约 7 秒）。
     music_enable: bool = False
     music_dir: str = "music"
     music_chunk_bytes: int = 4096
@@ -112,7 +127,14 @@ class Settings(BaseSettings):
     qweather_api_key: SecretStr | None = None
     qweather_timeout_sec: float = 5.0
     tool_router_enable: bool = False
-    tool_router_timeout_sec: float = 4.0
+    # 这个超时是真正生效的：resolve() 里用 asyncio.wait_for 包住了整个
+    # _tool_decide（建客户端 + 发请求 + 解析 JSON），超时就 return None 回落
+    # 闲聊，绝不阻塞对话。12.0 是按实测校准出来的：doubao-seed-2-0-lite
+    # 上 14 条样本 min=3.34s / 中位=5.92s / avg=6.96s / p90=10.16s / max=20.28s。
+    # 设成 4.0 会让绝大多数请求超时降级、工具能力形同虚设；12.0 只切掉极少数
+    # 离群值。注意路由本身的开销是每轮固定多一次 LLM 调用，这个延迟是这条
+    # 路径的固有成本，不是超时值能解决的。
+    tool_router_timeout_sec: float = 12.0
     tool_router_min_confidence: float = 0.65
     tool_router_music_min_confidence: float = 0.75
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问

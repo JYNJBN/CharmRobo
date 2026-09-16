@@ -96,13 +96,15 @@ async def run_turn(
     返回值说明：逐段 yield LLM 生成的文字增量（与 stream_chat 一致）。
     使用注意事项：本函数只负责「对话智能」，音频 I/O 由路由处理。
 
-    # ===== 记忆 / 智能体 扩展点（后续在此接入，不破坏现有调用方）=====
-    # 1. 检索记忆：memories = await retrieve_memories(conversation_id, user_text)
-    #    并把它们注入 messages（如追加 system 提示或拼到 user 消息里）。
-    # 2. 工具 / 智能体：在此包裹 agent loop（如 langgraph / 自写循环），
-    #    对外仍 yield 文字增量，调用方无需改动。
-    # 3. 落库：本轮结束后调用 add_conversation_message(...) 保存，
-    #    或在此统一写记忆，避免散落在各路由。
+    记忆检索（已实现）：当 user_id 与 agent_id 都齐全时，会先用 embed_text 把本轮用户
+    文字向量化，再在 Milvus 里检索该用户 / 该智能体的 TopK=3 条对话摘要，拼成
+    memory_context 作为 system 消息插入 messages 开头。检索失败或没有命中都只记日志，
+    不影响本轮对话；缺 user_id / agent_id 时直接跳过。
+
+    仍待接入（后续在此扩展，不破坏现有调用方）：
+      1. 智能体 / 工具循环：在此包裹 agent loop（如 langgraph / 自写循环），
+         并把 tools 一路透传到 stream_chat，对外仍 yield 文字增量，调用方无需改动。
+      2. 落库：本轮结束后统一写记忆，避免散落在各路由。
     """
     EMPTY_UTTERANCE_REPLY = "我没听清，你再说一遍好吗？"
 
