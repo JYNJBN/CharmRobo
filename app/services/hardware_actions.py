@@ -88,24 +88,109 @@ _MUSIC_COMMAND_WORDS = (
 )
 _MUSIC_GENERIC_WORDS = ("", "歌", "歌曲", "音乐", "一首", "首歌", "一首歌", "歌听")
 
+# 常用城市的和风天气 LocationID 快表，命中就不必再打一次城市查询接口。
+# 表外的城市（包括区县）会在 WeatherService._resolve_location 里走
+# /geo/v2/city/lookup 动态解析 —— 所以这里只是「省一次请求」的加速表，
+# **不是能力边界**，用户说什么城市都能查到。
+# ID 全部来自和风天气城市查询接口的真实返回，不要凭印象改。
 _CITY_IDS = {
+    # 直辖市 / 一线
     "北京": "101010100",
     "上海": "101020100",
     "广州": "101280101",
     "深圳": "101280601",
-    "杭州": "101210101",
-    "南京": "101190101",
-    "苏州": "101190401",
-    "成都": "101270101",
+    "天津": "101030100",
     "重庆": "101040100",
+    # 省会 / 首府
+    "石家庄": "101090101",
+    "太原": "101100101",
+    "呼和浩特": "101080101",
+    "沈阳": "101070101",
+    "长春": "101060101",
+    "哈尔滨": "101050101",
+    "南京": "101190101",
+    "杭州": "101210101",
+    "合肥": "101220101",
+    "福州": "101230101",
+    "南昌": "101240101",
+    "济南": "101120101",
+    "郑州": "101180101",
     "武汉": "101200101",
     "长沙": "101250101",
+    "南宁": "101300101",
+    "海口": "101310101",
+    "成都": "101270101",
+    "贵阳": "101260101",
+    "昆明": "101290101",
+    "拉萨": "101140101",
     "西安": "101110101",
-    "天津": "101030100",
+    "兰州": "101160101",
+    "西宁": "101150101",
+    "银川": "101170101",
+    "乌鲁木齐": "101130101",
+    # 计划单列市 / 强二线
+    "大连": "101070201",
     "青岛": "101120201",
+    "宁波": "101210401",
     "厦门": "101230201",
+    "苏州": "101190401",
+    "无锡": "101190201",
+    "常州": "101191101",
+    "南通": "101190501",
+    "徐州": "101190801",
+    "温州": "101210701",
+    # 广东省内（设备主力市场）
     "东莞": "101281601",
+    "珠海": "101280701",
+    "佛山": "101280800",
+    "惠州": "101280301",
+    "中山": "101281701",
+    "江门": "101281101",
+    "肇庆": "101280901",
+    "湛江": "101281001",
+    "茂名": "101282001",
+    "汕头": "101280501",
+    "潮州": "101281501",
+    "揭阳": "101281901",
+    "汕尾": "101282101",
+    "河源": "101281201",
+    "阳江": "101281801",
+    "清远": "101281301",
+    "韶关": "101280201",
+    "梅州": "101280401",
+    "云浮": "101281401",
+    # 旅游热门
+    "三亚": "101310201",
+    "桂林": "101300501",
+    "大理": "101290201",
+    "丽江": "101291401",
+    "张家界": "101251101",
+    "黄山": "101221001",
+    "洛阳": "101180901",
+    "烟台": "101120501",
+    "泉州": "101230501",
 }
+
+# 城市查询结果缓存，含「查过了但不存在」这一结果 —— 不缓存失败会让每次
+# 说错城市名都白打一次网络请求。条数很少，超限就丢最早的一条。
+_LOCATION_CACHE: dict[str, str | None] = {}
+_LOCATION_CACHE_LIMIT = 500
+
+
+def _strip_city_suffix(city: str) -> str:
+    """去掉「市」后缀，让「深圳市」「北京市」也能命中本地快表。"""
+
+    name = (city or "").strip()
+    if len(name) > 1 and name.endswith("市"):
+        return name[:-1]
+    return name
+
+
+def _remember_location(name: str, location_id: str | None) -> None:
+    if len(_LOCATION_CACHE) >= _LOCATION_CACHE_LIMIT:
+        _LOCATION_CACHE.pop(next(iter(_LOCATION_CACHE)))
+    _LOCATION_CACHE[name] = location_id
+
 _WEATHER_WORDS = (
     "天气",
     "气温",
@@ -308,9 +393,12 @@ class WeatherService:
         """按动作路由已经解析出的城市和日期查询天气。"""
 
         key = self.config.qweather_api_key.get_secret_value()
-        location = _CITY_IDS.get(intent.city)
+        # 「深圳市」先统一成「深圳」再播报：否则语音里会念成"深圳市现在多云"，
+        # 而且本地快表也命中不了，白白多打一次城市查询接口。
+        city = _strip_city_suffix(intent.city) or intent.city
+        location = await self._resolve_location(city, key)
         if not location:
-            return f"暂时查不到{intent.city}的天气信息。"
+            return f"暂时查不到{city}的天气信息。"
         path = "/v7/weather/3d" if intent.forecast else "/v7/weather/now"
         try:
             async with httpx.AsyncClient(
@@ -331,12 +419,64 @@ class WeatherService:
                     if items
                     else {}
                 )
-                return f"{intent.city}{'明天' if intent.day_offset == 1 else '后天' if intent.day_offset == 2 else '今天'}{item.get('textDay', '')}，气温{item.get('tempMin', '')}到{item.get('tempMax', '')}度。"
+                return f"{city}{'明天' if intent.day_offset == 1 else '后天' if intent.day_offset == 2 else '今天'}{item.get('textDay', '')}，气温{item.get('tempMin', '')}到{item.get('tempMax', '')}度。"
             now = payload.get("now") or {}
-            return f"{intent.city}现在{now.get('text', '')}，气温{now.get('temp', '')}度，体感{now.get('feelsLike', '')}度。"
+            return f"{city}现在{now.get('text', '')}，气温{now.get('temp', '')}度，体感{now.get('feelsLike', '')}度。"
         except Exception as exc:
             logger.warning("天气查询失败 city=%s error=%s", intent.city, exc)
             raise
+
+    async def _resolve_location(self, city: str, key: str) -> str | None:
+        """把城市名换成和风天气的 LocationID。
+
+        本地快表命中就直接用；表外（任何地级市、区县、县级市）走城市查询
+        接口动态解析，结果进缓存。这样「能查哪些城市」不再由代码里的白名单
+        决定 —— 用户说得出名字的地方基本都能查到。
+        """
+
+        name = _strip_city_suffix(city)
+        if not name:
+            return None
+        if name in _CITY_IDS:
+            return _CITY_IDS[name]
+        if name in _LOCATION_CACHE:
+            return _LOCATION_CACHE[name]
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.config.qweather_timeout_sec
+            ) as client:
+                response = await client.get(
+                    f"{self.config.qweather_api_host.rstrip('/')}"
+                    "/geo/v2/city/lookup",
+                    params={"location": name},
+                    headers={"X-QW-Api-Key": key},
+                )
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            # 网络类失败不写缓存，下次还能重试。
+            logger.warning("城市查询失败 city=%s error=%s", name, exc)
+            return None
+
+        # 注意：城市不存在时接口返回的是 HTTP 400 + {"error": {...}}，
+        # 不是 {"code": "404"}，所以不能只看 code，要连 location 一起判。
+        items = payload.get("location") or []
+        if str(payload.get("code")) != "200" or not items:
+            logger.info(
+                "城市查询无结果 city=%s payload=%s", name, str(payload)[:160]
+            )
+            _remember_location(name, None)
+            return None
+
+        location_id = items[0].get("id")
+        logger.info(
+            "城市查询命中 city=%s -> id=%s 官方名=%s",
+            name,
+            location_id,
+            items[0].get("name"),
+        )
+        _remember_location(name, location_id)
+        return location_id
 
     def _parse(self, text: str) -> WeatherIntent | None:
         raw = text or ""
