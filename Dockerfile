@@ -1,8 +1,10 @@
 # 使用和你本地项目一致的 Python 3.10。
 FROM python:3.10-slim-bookworm
 
-# 从 uv 官方镜像中复制 uv 命令。
-COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
+# 用腾讯云 PyPI 镜像安装 uv。
+# 原来是从 ghcr.io/astral-sh/uv 复制，但 ghcr.io 在国内不稳定（构建中途 EOF），
+# 改成 pip 装同一个版本后，Docker 构建不再依赖 github 系域名，也就不再需要代理。
+RUN pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple/ uv==0.12.5
 
 WORKDIR /app
 
