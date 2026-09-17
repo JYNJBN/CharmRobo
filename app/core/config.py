@@ -167,10 +167,19 @@ class Settings(BaseSettings):
     # 上下文和摘要配置，单位都是消息条数，不是问答轮数
     short_term_context_messages: int = 6
     summary_batch_messages: int = 6
-    # SiliconFlow Embedding 配置
-    siliconflow_api_key: SecretStr | None = None
-    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
-    embedding_model: str = "BAAI/bge-m3"
+    # 向量模型配置。变量名刻意做成**供应商无关**的 —— 换供应商只改 .env 三行，
+    # 代码一行不用动（embedding.py 用的是标准 OpenAI 兼容接口）。
+    # API Key 可单独配置，也可回退复用百炼的 qwen_api_key（与
+    # qwen_audio_realtime_api_key 同一个约定，见 resolved_embedding_api_key）。
+    embedding_api_key: SecretStr | None = None
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    embedding_model: str = "qwen3.7-text-embedding-flash"
+    # ★ 换模型时这个数字必须跟着改，因为 Milvus collection 是照它建的：
+    #   维度一旦变了，就只能重建 collection 并重新 embedding 全部历史数据 ——
+    #   改不动就说明这个模型不能换。当前 1024 与 qwen3.7-text-embedding-flash
+    #   的默认维度一致（该模型还支持 768/512/256，靠 dimensions 参数指定）。
+    #   ⚠️ 维度相同**不代表能混用**：向量空间不同，换模型后旧向量全部作废，
+    #      必须清空 collection 重新灌数据，否则相似度分数无意义。
     embedding_dimension: int = 1024
     embedding_metric_type: str = "COSINE"
     # 长期记忆最低余弦相似度。当前 Milvus 使用 COSINE，分数越大越相关；
@@ -189,6 +198,16 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}"
             f"/{self.postgres_database}"
         )
+
+    @property
+    def resolved_embedding_api_key(self) -> SecretStr | None:
+        """向量模型实际使用的 Key；未单独配置时回退到百炼的 qwen_api_key。
+
+        注意这里**只回退到百炼**，不回退硅基流动。历史坑：一旦代码里留着
+        「新变量为空就读旧供应商变量」的逻辑，服务器 .env 里没删干净的老值
+        就会悄悄盖掉新配置，表现为「明明改了却还是老模型」。
+        """
+        return self.embedding_api_key or self.qwen_api_key
 
 
 settings = Settings()

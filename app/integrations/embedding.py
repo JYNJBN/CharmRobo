@@ -12,14 +12,24 @@ _embedding_client: AsyncOpenAI | None = None
 
 def get_embedding_client() -> AsyncOpenAI:
     global _embedding_client
-    if settings.siliconflow_api_key is None:
-        raise RuntimeError("没有配置SILICONFLOW_API_KEY")
+    api_key = settings.resolved_embedding_api_key
+    if api_key is None:
+        raise RuntimeError(
+            "没有配置向量模型的 Key：请在 .env 设置 EMBEDDING_API_KEY，"
+            "或复用百炼的 QWEN_API_KEY"
+        )
     if _embedding_client is None:
-        logger.info("[Embedding] 创建全局客户端")
+        # 把模型名打进日志：换供应商之后「到底在用哪个模型」必须可查，
+        # 而不是靠猜。
+        logger.info(
+            "[Embedding] 创建全局客户端 model=%s base_url=%s",
+            settings.embedding_model,
+            settings.embedding_base_url,
+        )
         _embedding_client = AsyncOpenAI(
-            api_key=settings.siliconflow_api_key.get_secret_value(),
+            api_key=api_key.get_secret_value(),
             # 清除右边多余/ 防止拼接出现//的情况
-            base_url=settings.siliconflow_base_url.rstrip("/"),
+            base_url=settings.embedding_base_url.rstrip("/"),
             timeout=30,
         )
     else:
@@ -35,7 +45,13 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     client = get_embedding_client()
 
     response = await client.embeddings.create(
-        model=settings.embedding_model, input=texts, encoding_format="float"
+        model=settings.embedding_model,
+        input=texts,
+        encoding_format="float",
+        # 显式指定维度，不吃服务端默认值：默认值一旦变化会直接撞上下面的维度
+        # 校验并报错，比悄悄写入错误维度的向量（Milvus 照收，检索全乱）好排查。
+        # 注意：并非所有 OpenAI 兼容端点都支持 dimensions 参数，换供应商时留意。
+        dimensions=settings.embedding_dimension,
     )
     # print(response.data,'response')
     items = sorted(response.data, key=lambda item: item.index)
