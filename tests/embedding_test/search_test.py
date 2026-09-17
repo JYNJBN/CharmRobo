@@ -1,17 +1,22 @@
+import os
+from pathlib import Path
+
 import httpx
+from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/embeddings"
 MODEL = "BAAI/bge-m3"
 COLLECTION_NAME = "conversation_summary_v1"
 
+# 密钥只从项目根目录的 .env 读；该文件已在 .gitignore 里，不会进仓库。
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
 
 def get_embedding(text: str) -> list[float]:
-    # api_key = os.getenv("SILICONFLOW_API_KEY")
-    api_key = "sk-zgzndnouqesrexdmdxdtopbltxbwjoifsyqnpzmyyoeyvjao"
-
+    api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("没有找到 SILICONFLOW_API_KEY")
+        raise RuntimeError("没有找到 SILICONFLOW_API_KEY，请检查项目根目录的 .env")
 
     response = httpx.post(
         SILICONFLOW_URL,
