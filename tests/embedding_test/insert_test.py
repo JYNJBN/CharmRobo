@@ -1,10 +1,10 @@
-
 import httpx
 from pymilvus import MilvusClient
 
 SILICONFLOW_URL = "https://api.siliconflow.cn/v1/embeddings"
 MODEL = "BAAI/bge-m3"
 COLLECTION_NAME = "conversation_summary_v1"
+
 
 def get_embedding(text: str) -> list[float]:
     # api_key = os.getenv("SILICONFLOW_API_KEY")
@@ -31,8 +31,10 @@ def get_embedding(text: str) -> list[float]:
 
     result = response.json()
     return result["data"][0]["embedding"]
-def main() ->None:
-    summary_text="用户喜欢晚上看视频"
+
+
+def main() -> None:
+    summary_text = "用户喜欢晚上看视频"
     embedding = get_embedding(summary_text)
     client = MilvusClient(
         uri="http://127.0.0.1:19530",

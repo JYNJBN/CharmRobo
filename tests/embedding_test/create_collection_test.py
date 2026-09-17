@@ -4,7 +4,8 @@ COLLECTION_NAME = "conversation_summary_v1"
 
 VECTOR_DIM = 1024
 
-def main ()->None:
+
+def main() -> None:
     client = MilvusClient(url="http://127.0.0.1:19530")
     if client.has_collection(collection_name=COLLECTION_NAME):
         print(f"Collection 已存在：{COLLECTION_NAME}")

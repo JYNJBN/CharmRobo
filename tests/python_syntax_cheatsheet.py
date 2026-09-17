@@ -24,17 +24,17 @@ def demo_types():
     h("1. 数据类型 & 变量")
 
     # ---- 基本类型(注意:Python 没有 const/let,一切都是直接赋值)
-    name = "ARCS"                 # str    ← JS 的 string
-    count = 42                    # int    ← JS 的 number(Python 里 int 任意精度,不会溢出)
-    price = 19.99                 # float  ← JS 的 number
-    is_online = True              # bool   ← 注意首字母大写!Java 的 true → Python 的 True
-    nothing = None                # None   ← JS 的 null / Java 的 null(单例)
+    name = "ARCS"  # str    ← JS 的 string
+    count = 42  # int    ← JS 的 number(Python 里 int 任意精度,不会溢出)
+    price = 19.99  # float  ← JS 的 number
+    is_online = True  # bool   ← 注意首字母大写!Java 的 true → Python 的 True
+    nothing = None  # None   ← JS 的 null / Java 的 null(单例)
 
     print(type(name), type(count), type(is_online), type(nothing))
 
     # ---- 多变量赋值 + 解包(JS 的解构赋值)
-    a, b = 1, 2                   # ≈ JS: const [a, b] = [1, 2]
-    a, b = b, a                   # 交换,不需要临时变量(Java 里做不到)
+    a, b = 1, 2  # ≈ JS: const [a, b] = [1, 2]
+    a, b = b, a  # 交换,不需要临时变量(Java 里做不到)
     print(f"a={a} b={b}")
 
     # ---- 类型转换
@@ -47,7 +47,7 @@ def demo_types():
 
     # ---- 多赋值解包进阶:* 收集剩余(JS 的 rest)
     first, *rest, last = [1, 2, 3, 4, 5]
-    print(f"first={first} rest={rest} last={last}")   # rest 永远是 list
+    print(f"first={first} rest={rest} last={last}")  # rest 永远是 list
 
     # ---- 类型注解(只是提示,运行时不校验!≈ TS 的类型但不会报错)
     device_sn: str = "ARCS-A1-0001"
@@ -62,28 +62,28 @@ def demo_string():
 
     # f-string —— 最推荐的格式化方式(JS 的模板字符串)
     sn = "A1-0001"
-    print(f"设备 {sn} 上线,时间 {2026}")          # ≈ JS: `设备 ${sn} 上线`
-    print(f"{3.14159:.2f}")                        # :.2f = 保留 2 位小数
-    print(f"{sn:>15}")                             # :>15 = 右对齐宽 15
-    print(f"{sn!r}")                               # !r = 显示 repr(带引号)
+    print(f"设备 {sn} 上线,时间 {2026}")  # ≈ JS: `设备 ${sn} 上线`
+    print(f"{3.14159:.2f}")  # :.2f = 保留 2 位小数
+    print(f"{sn:>15}")  # :>15 = 右对齐宽 15
+    print(f"{sn!r}")  # !r = 显示 repr(带引号)
 
     # 拼接 / 分割
-    print("-".join(["a", "b", "c"]))               # "a-b-c"  ← JS: arr.join("-")
-    print("a,b,c".split(","))                      # ['a','b','c'] ← JS: str.split(",")
-    print("a b\nc".splitlines())                   # 按行切,比 split("\n") 稳
+    print("-".join(["a", "b", "c"]))  # "a-b-c"  ← JS: arr.join("-")
+    print("a,b,c".split(","))  # ['a','b','c'] ← JS: str.split(",")
+    print("a b\nc".splitlines())  # 按行切,比 split("\n") 稳
 
     # 清洗
-    print(repr(s.strip()))                         # 去首尾空白 ← JS trim()
-    print(repr(s.lstrip()), repr(s.rstrip()))      # trimStart / trimEnd
+    print(repr(s.strip()))  # 去首尾空白 ← JS trim()
+    print(repr(s.lstrip()), repr(s.rstrip()))  # trimStart / trimEnd
 
     # 查找判断
-    print("ARCS" in s)                             # 包含判断,JS: s.includes("ARCS")
-    print(s.find("ARCS"))                          # 找不到返回 -1(JS indexOf 同)
-    print(s.index("ARCS"))                         # 找不到直接抛 ValueError!
+    print("ARCS" in s)  # 包含判断,JS: s.includes("ARCS")
+    print(s.find("ARCS"))  # 找不到返回 -1(JS indexOf 同)
+    print(s.index("ARCS"))  # 找不到直接抛 ValueError!
     print(s.startswith("  He"), s.endswith("Mini  "))
 
     # 替换 / 大小写
-    print(s.replace("Mini", "Pro"))                # JS replace 只换第一个,Python 默认换全部
+    print(s.replace("Mini", "Pro"))  # JS replace 只换第一个,Python 默认换全部
     print(s.upper(), s.lower(), s.title())
 
     # 判断类(Java 里要写正则,Python 直接有)
@@ -91,11 +91,11 @@ def demo_string():
 
     # 切片 —— Python 的灵魂,str/list/tuple 通用
     t = "HelloWorld"
-    print(t[0:5])     # 'Hello'  左闭右开 [start:end)
-    print(t[5:])      # 'World'
-    print(t[:5])      # 'Hello'
-    print(t[::2])     # 'Hlool'  步长 2
-    print(t[::-1])    # 'dlroWolleH'  ← 反转字符串,Python 最经典写法
+    print(t[0:5])  # 'Hello'  左闭右开 [start:end)
+    print(t[5:])  # 'World'
+    print(t[:5])  # 'Hello'
+    print(t[::2])  # 'Hlool'  步长 2
+    print(t[::-1])  # 'dlroWolleH'  ← 反转字符串,Python 最经典写法
     print(t[-1], t[-3:])  # 负索引:从尾部数
 
 
@@ -104,25 +104,25 @@ def demo_list():
     h("3. list 常用方法(= JS 的 Array)")
 
     nums = [3, 1, 2]
-    nums.append(4)          # push
-    nums.insert(0, 0)       # unshift(插到指定位置)
-    nums.extend([5, 6])     # ≈ push(...arr) / concat
+    nums.append(4)  # push
+    nums.insert(0, 0)  # unshift(插到指定位置)
+    nums.extend([5, 6])  # ≈ push(...arr) / concat
     print(nums)
 
-    print(nums.pop())       # pop() 删并返回最后一个
-    print(nums.pop(0))      # shift() 删并返回第一个
-    nums.remove(3)          # 按"值"删第一个匹配项(JS 没有对应,得用 splice+indexOf)
+    print(nums.pop())  # pop() 删并返回最后一个
+    print(nums.pop(0))  # shift() 删并返回第一个
+    nums.remove(3)  # 按"值"删第一个匹配项(JS 没有对应,得用 splice+indexOf)
     print(nums)
 
-    print(nums.index(2))    # indexOf
-    print(nums.count(2))    # 出现次数(JS 没有)
-    print(2 in nums)        # includes
+    print(nums.index(2))  # indexOf
+    print(nums.count(2))  # 出现次数(JS 没有)
+    print(2 in nums)  # includes
 
-    nums.sort()                        # 原地排序(改自己)
-    nums.sort(key=lambda x: -x)        # 按规则排,key ≈ JS sort((a,b)=>...) 的映射版
+    nums.sort()  # 原地排序(改自己)
+    nums.sort(key=lambda x: -x)  # 按规则排,key ≈ JS sort((a,b)=>...) 的映射版
     print(nums)
     print(sorted(nums, reverse=True))  # 返回新列表,不改原列表
-    nums.reverse()                     # 原地反转
+    nums.reverse()  # 原地反转
     print(nums)
 
     # 切片 = JS 的 slice(但功能更强)
@@ -130,16 +130,16 @@ def demo_list():
 
     # 清空 / 复制(深浅拷贝坑!)
     a = [1, [2, 3]]
-    b = a.copy()            # 浅拷贝:内层 list 还是共享的!
+    b = a.copy()  # 浅拷贝:内层 list 还是共享的!
     import copy
-    c = copy.deepcopy(a)    # 深拷贝
+    c = copy.deepcopy(a)  # 深拷贝
     a[1].append(9)
     print(f"浅拷贝也被改了: {b}  深拷贝没事: {c}")
 
     # 枚举 / 同时遍历(Java/JS 都要写 index 循环,Python 直接来)
     for i, v in enumerate(["a", "b", "c"]):
         print(f"  [{i}] = {v}")
-    for x, y in zip([1, 2], ["a", "b"]):   # 拉链合并
+    for x, y in zip([1, 2], ["a", "b"]):  # 拉链合并
         print(f"  {x}->{y}")
 
 
@@ -151,25 +151,25 @@ def demo_dict():
 
     # 取值:[] 找不到会 KeyError,get() 找不到返回 None 或默认值
     print(d["sn"])
-    print(d.get("not_exist"))              # None
-    print(d.get("not_exist", "默认值"))     # JS 里没有,Java Map.getOrDefault 同款
-    print(d.setdefault("model", "doubao")) # 没有就塞进去并返回,有就直接返回
+    print(d.get("not_exist"))  # None
+    print(d.get("not_exist", "默认值"))  # JS 里没有,Java Map.getOrDefault 同款
+    print(d.setdefault("model", "doubao"))  # 没有就塞进去并返回,有就直接返回
 
     # 增删改
     d["owner"] = "wugf"
-    d.update({"model": "deepseek", "ver": 2})   # ≈ JS Object.assign / {...a, ...b}
+    d.update({"model": "deepseek", "ver": 2})  # ≈ JS Object.assign / {...a, ...b}
     print(d)
-    removed = d.pop("ver")                      # 删并返回
-    d.pop("nothing", None)                      # 安全的删,不存在不报错
-    last = d.popitem()                          # 删并返回最后一对 (k, v)
+    removed = d.pop("ver")  # 删并返回
+    d.pop("nothing", None)  # 安全的删,不存在不报错
+    last = d.popitem()  # 删并返回最后一对 (k, v)
     print(f"removed={removed} last={last} -> {d}")
 
     # 遍历(三种,用得最多的是 items())
-    for k in d:                     # 只拿 key
+    for k in d:  # 只拿 key
         pass
-    for v in d.values():            # 只拿 value
+    for v in d.values():  # 只拿 value
         pass
-    for k, v in d.items():          # ★ 最常用 key + value
+    for k, v in d.items():  # ★ 最常用 key + value
         print(f"  {k} = {v}")
 
     # 判断 / 长度
@@ -177,11 +177,11 @@ def demo_dict():
 
     # 构造技巧
     keys = ["a", "b"]
-    print(dict.fromkeys(keys, 0))   # {'a': 0, 'b': 0} 初始化计数器的常用写法
+    print(dict.fromkeys(keys, 0))  # {'a': 0, 'b': 0} 初始化计数器的常用写法
 
     # 合并(3.9+)
     x, y = {"a": 1}, {"b": 2}
-    print(x | y)                    # 合并成新 dict
+    print(x | y)  # 合并成新 dict
 
 
 # ---------------------------------------------------------------- 5. 集合 & 元组
@@ -190,18 +190,18 @@ def demo_set_tuple():
 
     # set = 无序、自动去重(JS 的 Set)
     s = {1, 2, 2, 3}
-    print(s)                        # {1, 2, 3}
+    print(s)  # {1, 2, 3}
     s.add(4)
-    s.discard(99)                   # 删,不存在也不报错
+    s.discard(99)  # 删,不存在也不报错
     # s.remove(99)                  # 删,不存在会 KeyError
-    print(s | {9}, s & {1, 2}, s - {1})   # 并集 / 交集 / 差集
+    print(s | {9}, s & {1, 2}, s - {1})  # 并集 / 交集 / 差集
 
     # 去重最快写法(会丢顺序,要保序用 dict.fromkeys)
     print(list(set([1, 1, 2, 2, 3])))
 
     # tuple = 不可变 list(Java 没有对应;≈ TS 的 readonly [number, string])
     point: tuple[int, int] = (10, 20)
-    x, y = point                    # 解包
+    x, y = point  # 解包
     print(x, y)
 
 
@@ -216,7 +216,7 @@ def demo_comprehension():
     print("偶数:", evens)
 
     # 带转换
-    print("平方:", [n ** 2 for n in nums])          # ** 是幂运算,不是异或!
+    print("平方:", [n ** 2 for n in nums])  # ** 是幂运算,不是异或!
 
     # 三元表达式写在里面
     print("标签:", ["大" if n > 3 else "小" for n in nums])
@@ -247,17 +247,19 @@ def demo_function():
         return f"{prefix}, {name}"
 
     print(greet("ARCS"))
-    print(greet("ARCS", prefix="Hi"))       # 关键字调用(Java 没有)
+    print(greet("ARCS", prefix="Hi"))  # 关键字调用(Java 没有)
     print(greet(name="ARCS", prefix="Yo"))  # 顺序都能换
 
     # ★ 大坑:默认参数别用可变对象!
-    def bad(items=[]):        # 这个 [] 只创建一次,所有调用共享!
+    def bad(items=[]):  # 这个 [] 只创建一次,所有调用共享!
         items.append(1)
         return items
+
     def good(items=None):
         items = items if items is not None else []
         items.append(1)
         return items
+
     r1, r2 = bad(), bad()
     print(f"bad: 第一次={r1} 第二次={r2} 是同一个对象? {r1 is r2}  ← 被污染了")
     g1, g2 = good(), good()
@@ -267,11 +269,13 @@ def demo_function():
     def log(*args, **kwargs):
         print(f"  位置参数(元组): {args}")
         print(f"  关键字参数(字典): {kwargs}")
+
     log(1, 2, level="ERROR", tag="arcs")
 
     def add(a, b):
         return a + b
-    print(add(*[1, 2]))             # * 拆包 list 当位置参数传
+
+    print(add(*[1, 2]))  # * 拆包 list 当位置参数传
     print(add(**{"a": 1, "b": 2}))  # ** 拆包 dict 当关键字参数传
 
     # lambda:只能写一行表达式(JS 的箭头函数,但功能弱很多)
@@ -283,6 +287,7 @@ def demo_function():
     # 返回多个值 —— 本质是返回 tuple,外面自动解包
     def minmax(xs):
         return min(xs), max(xs)
+
     lo, hi = minmax([3, 1, 9])
     print(f"min={lo} max={hi}")
 
@@ -303,32 +308,32 @@ class Device:
 class DeviceRepo:
     """普通类:注意每个方法第一个参数都是 self(≈ Java 的 this,但要显式写出来)"""
 
-    def __init__(self, name: str):       # 构造器
-        self.name = name                 # 实例属性(可以随时新增,不用先声明)
-        self._cache: dict[str, Device] = {}   # 单下划线 = 约定私有(不强制)
+    def __init__(self, name: str):  # 构造器
+        self.name = name  # 实例属性(可以随时新增,不用先声明)
+        self._cache: dict[str, Device] = {}  # 单下划线 = 约定私有(不强制)
 
     def add(self, d: Device) -> None:
         self._cache[d.sn] = d
 
-    def get(self, sn: str) -> Optional[Device]:   # Optional[X] = X | None
+    def get(self, sn: str) -> Optional[Device]:  # Optional[X] = X | None
         return self._cache.get(sn)
 
-    @property                            # getter,调用时不用加括号
+    @property  # getter,调用时不用加括号
     def count(self) -> int:
         return len(self._cache)
 
-    @staticmethod                        # 不依赖实例(Java static)
+    @staticmethod  # 不依赖实例(Java static)
     def version() -> str:
         return "1.0"
 
-    @classmethod                         # 拿到的是类本身,不是实例(工厂方法常用)
+    @classmethod  # 拿到的是类本身,不是实例(工厂方法常用)
     def empty(cls):
         return cls("empty")
 
-    def __len__(self):                   # 魔法方法:让 len(repo) 能用
+    def __len__(self):  # 魔法方法:让 len(repo) 能用
         return len(self._cache)
 
-    def __repr__(self):                  # ≈ Java 的 toString
+    def __repr__(self):  # ≈ Java 的 toString
         return f"<DeviceRepo {self.name} n={len(self._cache)}>"
 
 
@@ -337,8 +342,8 @@ def demo_class():
 
     d1 = Device(sn="A1-0001")
     d2 = Device(sn="A1-0001")
-    print(d1)                    # dataclass 自动生成 __repr__
-    print(d1 == d2)              # dataclass 自动生成 __eq__(原生 class 比的是内存地址!)
+    print(d1)  # dataclass 自动生成 __repr__
+    print(d1 == d2)  # dataclass 自动生成 __eq__(原生 class 比的是内存地址!)
 
     repo = DeviceRepo("main")
     repo.add(d1)
@@ -350,6 +355,7 @@ def demo_class():
     # 继承
     class Sensor(Device):
         pass
+
     print(issubclass(Sensor, Device), isinstance(d1, Device))
 
 
@@ -360,9 +366,9 @@ def demo_error_file():
     # try-except-else-finally(≈ Java 的 try-catch-finally)
     try:
         n = int("abc")
-    except ValueError as e:            # 捕获指定异常(推荐,别裸 except)
+    except ValueError as e:  # 捕获指定异常(推荐,别裸 except)
         print("  转换失败:", e)
-    except (TypeError, KeyError):      # 多个一起捕获
+    except (TypeError, KeyError):  # 多个一起捕获
         print("  其他类型错误")
     else:
         print("  没出异常才走这里")
@@ -372,8 +378,9 @@ def demo_error_file():
     # 主动抛出 & 自定义异常
     def bind(sn: str):
         if not sn:
-            raise ValueError("sn 不能为空")   # ≈ JS throw / Java throw
+            raise ValueError("sn 不能为空")  # ≈ JS throw / Java throw
         return True
+
     try:
         bind("")
     except ValueError as e:
@@ -381,13 +388,13 @@ def demo_error_file():
 
     # with = 自动关闭资源(≈ Java try-with-resources / JS 的 using)
     # 不用手动 close(),出了代码块自动关
-    with open("_demo_tmp.txt", "w", encoding="utf-8") as f:   # ★ Windows 一定要写 encoding!
+    with open("_demo_tmp.txt", "w", encoding="utf-8") as f:  # ★ Windows 一定要写 encoding!
         f.write("hello\n")
         f.writelines(["a\n", "b\n"])
     with open("_demo_tmp.txt", encoding="utf-8") as f:
         print("  读全部:", repr(f.read()))
         f.seek(0)
-        for line in f:                  # 大文件这么读,不一次性加载
+        for line in f:  # 大文件这么读,不一次性加载
             print("  逐行:", line.strip())
 
     import os
@@ -395,9 +402,9 @@ def demo_error_file():
 
     # JSON(前后端对接天天用)
     payload = {"sn": "A1", "online": True}
-    s = json.dumps(payload, ensure_ascii=False)     # 对象 -> 字符串(ensure_ascii=False 才不出 \uXXXX)
+    s = json.dumps(payload, ensure_ascii=False)  # 对象 -> 字符串(ensure_ascii=False 才不出 \uXXXX)
     print("  dumps:", s)
-    print("  loads:", json.loads(s))                # 字符串 -> 对象
+    print("  loads:", json.loads(s))  # 字符串 -> 对象
 
 
 # ---------------------------------------------------------------- 10. 装饰器 & async
@@ -407,16 +414,17 @@ def demo_decorator():
     import time
     from functools import wraps
 
-    def timing(fn):                     # 装饰器本质是:接收函数,返回函数
-        @wraps(fn)                      # 保留原函数的名字和文档,不加会丢元信息
+    def timing(fn):  # 装饰器本质是:接收函数,返回函数
+        @wraps(fn)  # 保留原函数的名字和文档,不加会丢元信息
         def wrapper(*args, **kwargs):
             t0 = time.perf_counter()
             r = fn(*args, **kwargs)
             print(f"  {fn.__name__} 耗时 {time.perf_counter() - t0:.4f}s")
             return r
+
         return wrapper
 
-    @timing                             # ≈ 写 slow(2) 实际是 timing(slow)(2)
+    @timing  # ≈ 写 slow(2) 实际是 timing(slow)(2)
     def slow(n):
         time.sleep(0.01)
         return n * 2
@@ -428,7 +436,7 @@ def demo_async():
     h("11. async/await(和 JS 几乎一样,但多一层)")
 
     async def fetch(sn: str, delay: float) -> str:
-        await asyncio.sleep(delay)      # await ≈ JS await,让出控制权
+        await asyncio.sleep(delay)  # await ≈ JS await,让出控制权
         return f"{sn} ok"
 
     async def main():
@@ -444,7 +452,7 @@ def demo_async():
         task = asyncio.create_task(fetch("A3", 0.02))
         print("  任务中:", await task)
 
-    asyncio.run(main())     # ★ 关键:JS 里顶层直接 await,Python 必须 asyncio.run() 启动事件循环
+    asyncio.run(main())  # ★ 关键:JS 里顶层直接 await,Python 必须 asyncio.run() 启动事件循环
 
     print("""
   JS vs Python 对照:
@@ -462,7 +470,7 @@ def demo_builtins():
     nums = [3, 1, 4, 1, 5, 9, 2, 6]
     print("len/sum/min/max/sorted:", len(nums), sum(nums), min(nums), max(nums), sorted(nums))
     print("abs/round/divmod:", abs(-5), round(3.14159, 2), divmod(17, 5))  # divmod -> (3, 2)
-    print("any/all:", any([0, 1]), all([1, 1]))     # ≈ JS some / every
+    print("any/all:", any([0, 1]), all([1, 1]))  # ≈ JS some / every
     print("enumerate/zip/range:", list(range(3)), list(enumerate("ab")))
     print("map/filter(返回迭代器,要 list 包一层):",
           list(map(str, [1, 2])), list(filter(lambda x: x > 3, nums)))

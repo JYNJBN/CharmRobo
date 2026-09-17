@@ -2,6 +2,7 @@ from pymilvus import MilvusClient
 
 COLLECTION_NAME = "conversation_summary_v1"
 
+
 def main() -> None:
     client = MilvusClient(
         uri="http://127.0.0.1:19530",
@@ -15,10 +16,11 @@ def main() -> None:
             "summary_text",
             "conversation_id",
             "device_id",
+            "agent_id",
             "user_id",
             "status",
         ],
-        limit=10
+        limit=10,
     )
     print("查询结果：")
     print(result)

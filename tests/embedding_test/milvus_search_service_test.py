@@ -16,7 +16,7 @@ async def main() -> None:
         limit=3,
     )
 
-    print("语义搜索结果：results",results)
+    print("语义搜索结果：results", results)
     memory_lines: list[str] = []
 
     for hits in results:
@@ -29,7 +29,8 @@ async def main() -> None:
             print(hit)
 
     print(memory_lines, "memory_lines")
-    print( "\n".join(memory_lines))
+    print("\n".join(memory_lines))
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,7 +1,7 @@
 from pymilvus import MilvusClient
 
 
-def main()->None:
+def main() -> None:
     client = MilvusClient(
         uri="http://127.0.0.1:19530",
     )
