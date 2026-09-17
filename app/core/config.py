@@ -112,10 +112,13 @@ class Settings(BaseSettings):
     #   关闭时也不会谎报成资源不存在 —— 不会说「本地曲库里还没有这首歌」，
     #   而是正常走闲聊。
     #
-    # ★ 推荐配置：想要「让 AI 判断天气」就开 weather_enable + tool_router_enable。
-    #   关键词层负责「XX天气/会不会下雨」这类显式问句（_CITY_IDS 能精确识别 16 个
-    #   城市、_parse 能提日期），路由层负责「拿伞/下雪/穿外套」这类不在词表里的
-    #   口语说法。两层互补，比只开路由更准。
+    # ★ 两种玩法（二选一，不要同时开）：
+    #   A. 关键词层 + 独立路由：weather_enable=true + tool_router_enable=true。
+    #      关键词层负责「XX天气/会不会下雨」这类显式问句（_CITY_IDS 能精确识别
+    #      16 个城市、_parse 能提日期），路由层负责「拿伞/下雪/穿外套」这类不在
+    #      词表里的口语说法。两层互补、比只开路由准，但每轮固定多一次 LLM 调用。
+    #   B. 工具直连（当前采用）：weather_enable=true + hardware_tool_calling_enable=true，
+    #     并把 tool_router_enable 关掉。整条 resolve() 短路，不再有独立判断。
     #   两个能力开关如果都关着，工具路由就没有任何可用动作了，resolve() 会直接
     #   短路跳过那次 LLM 调用（省掉每轮约 7 秒）。
     music_enable: bool = False
@@ -137,6 +140,26 @@ class Settings(BaseSettings):
     tool_router_timeout_sec: float = 12.0
     tool_router_min_confidence: float = 0.65
     tool_router_music_min_confidence: float = 0.75
+    # ★ 工具直连模式：把工具定义挂到**主对话那一次** LLM 请求上，由模型自己
+    #   决定「直接回答」还是「发起 get_weather 调用」。开启后 resolve() 整体
+    #   短路，关键词词表和 _tool_decide 都不再参与。
+    #
+    #   和 tool_router_enable 是互斥的两套方案：
+    #     - tool_router_enable：关键词层 → 独立的一次 LLM 路由判断 → 执行工具
+    #     - hardware_tool_calling_enable：只有一次 LLM 调用，判断和执行合在里面
+    #
+    #   收益：误报（"我觉得今天天气好差"被截胡去播天气）和漏检（拿伞/下雪/
+    #   穿外套不在词表）两类问题一并消失，因为根本不用维护词表了。
+    #   代价：每轮约 1 秒（关键词层命中时是 0.2 秒），但远好于独立路由的 3~20 秒。
+    #
+    #   实测（deepseek-v4-1-flash-260910 + thinking=disabled，2026-09-17）：
+    #     · 模型决定调工具时，流里**只有 tool_calls、一个 content 分片都没有**
+    #       ⇒ 可以边收边判模式，不存在"先吐半句话再改口"的问题
+    #     · 调工具 0.94~1.11 秒；闲聊首字 0.72~0.79 秒
+    #     · thinking=disabled 与 tools 可以共存
+    #   注意：流式与非流式在"没提城市"时行为不完全一致（流式倾向反问城市），
+    #   所以工具描述里写明了"留空即用设备默认城市"。
+    hardware_tool_calling_enable: bool = False
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问
     upload_dir: str = "uploads"
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。

@@ -12,10 +12,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from time import perf_counter
+from typing import Any
 
-from app.integrations.ai import build_instructions, stream_chat
+from app.integrations.ai import (
+    build_instructions,
+    stream_chat,
+    stream_chat_with_tools,
+)
 from app.integrations.embedding import embed_text
 from app.integrations.milvus import search_summaries
 from app.schemas.Model import ModelRegistryObject
@@ -83,6 +88,8 @@ async def run_turn(
         trace_id: str = "standalone",
         model: ModelRegistryObject | None = None,
         model_label: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        execute_tool: Callable[[str, Any], Awaitable[str | None]] | None = None,
 ) -> AsyncIterator[str]:
     """功能说明：执行一轮对话，流式产出 LLM 文字增量。
 
@@ -101,10 +108,13 @@ async def run_turn(
     memory_context 作为 system 消息插入 messages 开头。检索失败或没有命中都只记日志，
     不影响本轮对话；缺 user_id / agent_id 时直接跳过。
 
+    工具调用（已实现）：同时传入 tools 与 execute_tool 时改走 stream_chat_with_tools，
+    工具定义随 messages 一起发给模型，模型在**同一次**调用里决定直接回答还是发起
+    工具调用。命中就执行工具、把成品文案 yield 出去，不做第二次 LLM 整合。
+    不传 tools 时行为与改造前完全一致（走普通 stream_chat）。
+
     仍待接入（后续在此扩展，不破坏现有调用方）：
-      1. 智能体 / 工具循环：在此包裹 agent loop（如 langgraph / 自写循环），
-         并把 tools 一路透传到 stream_chat，对外仍 yield 文字增量，调用方无需改动。
-      2. 落库：本轮结束后统一写记忆，避免散落在各路由。
+      1. 落库：本轮结束后统一写记忆，避免散落在各路由。
     """
     EMPTY_UTTERANCE_REPLY = "我没听清，你再说一遍好吗？"
 
@@ -234,6 +244,26 @@ async def run_turn(
         conversation_id,
         len(messages),
     )
+    if tools:
+        # 工具直连：判断和执行合在这一次 LLM 调用里，不再有独立的工具路由请求。
+        # 对外仍然 yield 文字增量，调用方（分句器 / TTS 队列）零改动。
+        logger.info(
+            "[对话][工具][%s] 本轮挂载工具数=%d conversation_id=%s",
+            trace_id,
+            len(tools),
+            conversation_id,
+        )
+        async for delta in stream_chat_with_tools(
+                messages=messages,
+                tools=tools,
+                execute_tool=execute_tool,
+                trace_id=trace_id,
+                model=model,
+                instructions=instructions,
+        ):
+            yield delta
+        return
+
     async for delta in stream_chat(
             messages=messages,
             previous_response_id=previous_response_id,

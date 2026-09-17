@@ -63,6 +63,10 @@ from app.services.conversation_service import (
 )
 from app.services.device_service import get_active_owner_binding, get_device_by_sn
 from app.services.hardware_actions import hardware_action_service
+from app.services.hardware_tools import (
+    build_hardware_tools,
+    execute_hardware_tool,
+)
 from app.services.model_service import resolve_model
 from app.services.voice_service import resolve_baidu_tts_per
 from app.utils.tools import local_now
@@ -191,9 +195,9 @@ class _HardwareSentenceSplitter:
 
 
 async def _load_hardware_session(
-    device_sn: str,
-    *,
-    trace_id: str = "unknown",
+        device_sn: str,
+        *,
+        trace_id: str = "unknown",
 ) -> HardwareSession:
     """校验硬件并加载当前智能体、模型和对话历史。
 
@@ -333,10 +337,10 @@ async def _load_hardware_session(
 
 
 async def _save_message(
-    session: HardwareSession,
-    *,
-    role: str,
-    content: str,
+        session: HardwareSession,
+        *,
+        role: str,
+        content: str,
 ) -> None:
     """使用独立数据库会话保存一条硬件语音对话消息。
 
@@ -355,15 +359,15 @@ async def _save_message(
 
 
 async def _run_hardware_turn(
-    *,
-    session: HardwareSession,
-    audio_data: bytes,
-    audio_format: str,
-    request_id: str,
-    turn_started_at: float,
-    send_bytes: SendBytes,
-    send_json: SendJson,
-    cancel_event: asyncio.Event,
+        *,
+        session: HardwareSession,
+        audio_data: bytes,
+        audio_format: str,
+        request_id: str,
+        turn_started_at: float,
+        send_bytes: SendBytes,
+        send_json: SendJson,
+        cancel_event: asyncio.Event,
 ) -> HardwareTurnResult:
     """执行一轮 ``音频 -> ASR -> LLM -> TTS -> MP3`` 流水线。
 
@@ -438,7 +442,20 @@ async def _run_hardware_turn(
     # ==================== 阶段 3：动作路由与统一音频输出 ====================
     action_started_at = perf_counter()
     logger.info("[HARDWARE-VOICE][%s][动作] 开始判断", request_id)
-    action_result = await hardware_action_service.resolve(asr_text, session.model)
+    # 工具直连模式：本轮不做关键词匹配、也不发独立的 LLM 路由请求，动作判断
+    # 整体挪到阶段 4 的主对话调用里（工具定义随请求上下文一起发）。这里必须
+    # 显式短路，否则整条 resolve() 会照跑一遍 —— 白花时间，还会被关键词层
+    # 半路截胡，模型根本没机会自己判断。
+    hardware_tools = build_hardware_tools()
+    if hardware_tools is not None:
+        action_result = None
+        logger.info(
+            "[HARDWARE-VOICE][%s][动作] 工具直连模式，跳过关键词与路由 工具数=%d",
+            request_id,
+            len(hardware_tools),
+        )
+    else:
+        action_result = await hardware_action_service.resolve(asr_text, session.model)
     logger.info(
         "[HARDWARE-VOICE][%s][动作] 判断完成 action=%s "
         "耗时=%.3f秒",
@@ -483,8 +500,8 @@ async def _run_hardware_turn(
             len(text),
         )
         async for chunk in baidu_speech_client.stream_synthesize_mp3(
-            text,
-            per=baidu_per,
+                text,
+                per=baidu_per,
         ):
             await send_audio_chunk(chunk)
         logger.info(
@@ -515,8 +532,8 @@ async def _run_hardware_turn(
                 action_result.track.size,
             )
             async for chunk in hardware_action_service.music.iter_track_bytes(
-                action_result.track,
-                cancel_event=cancel_event,
+                    action_result.track,
+                    cancel_event=cancel_event,
             ):
                 await send_audio_chunk(chunk)
             logger.info(
@@ -549,7 +566,7 @@ async def _run_hardware_turn(
             audio_bytes=audio_bytes,
             audio_chunks=audio_chunks,
             first_chunk_ms=first_chunk_ms
-            or int((perf_counter() - turn_started_at) * 1000),
+                           or int((perf_counter() - turn_started_at) * 1000),
             action=action_result.action,
         )
 
@@ -586,8 +603,8 @@ async def _run_hardware_turn(
                     len(sentence),
                 )
                 async for chunk in baidu_speech_client.stream_synthesize_mp3(
-                    sentence,
-                    per=baidu_per,
+                        sentence,
+                        per=baidu_per,
                 ):
                     await send_audio_chunk(chunk)
                 logger.info(
@@ -609,17 +626,21 @@ async def _run_hardware_turn(
         # run_turn 是小程序和硬件共用的文字对话核心：它负责短期历史、长期记忆、
         # 智能体人设和具体模型供应商，逐段 yield LLM 新增文字。
         async for delta in run_turn(
-            asr_text,
-            session.history_messages,
-            session.conversation_id,
-            user_id=session.user_id,
-            device_id=session.device_id,
-            trace_id=request_id,
-            agent_id=session.agent_id,
-            agent_name=session.agent_name,
-            agent_system_prompt=session.agent_system_prompt,
-            model=session.model,
-            model_label=session.model_label,
+                asr_text,
+                session.history_messages,
+                session.conversation_id,
+                user_id=session.user_id,
+                device_id=session.device_id,
+                trace_id=request_id,
+                agent_id=session.agent_id,
+                agent_name=session.agent_name,
+                agent_system_prompt=session.agent_system_prompt,
+                model=session.model,
+                model_label=session.model_label,
+                # 工具直连模式下 hardware_tools 非 None；开关关闭时是 None，
+                # run_turn 会退回普通流式对话，行为与改造前完全一致。
+                tools=hardware_tools,
+                execute_tool=execute_hardware_tool,
         ):
             check_cancelled()
             if first_llm_delta_at is None:
@@ -769,7 +790,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     session: HardwareSession | None = None
     # device_sn 的连接级兜底来源。start JSON 中的值始终优先。
     connection_device_sn = (
-        client.query_params.get("device_sn") or client.headers.get("x-device-sn") or ""
+            client.query_params.get("device_sn") or client.headers.get("x-device-sn") or ""
     ).strip()
     connection_device_ip = client.headers.get("x-device-ip", "").strip()
     client_req: object = None
@@ -777,14 +798,14 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     turn_cancel_event: asyncio.Event | None = None
 
     async def run_turn_worker(
-        *,
-        worker_request_id: str,
-        worker_client_req: object,
-        worker_cancel_event: asyncio.Event,
-        worker_session: HardwareSession,
-        worker_audio_data: bytes,
-        worker_audio_format: str,
-        worker_started_at: float,
+            *,
+            worker_request_id: str,
+            worker_client_req: object,
+            worker_cancel_event: asyncio.Event,
+            worker_session: HardwareSession,
+            worker_audio_data: bytes,
+            worker_audio_format: str,
+            worker_started_at: float,
     ) -> None:
         """后台执行一轮软件流水线，让主 WS 协程继续接收 cancel。"""
 
@@ -1092,10 +1113,10 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                         trace_id=request_id,
                     )
                 except (
-                    HardwareVoiceError,
-                    BizError,
-                    SQLAlchemyError,
-                    ValueError,
+                        HardwareVoiceError,
+                        BizError,
+                        SQLAlchemyError,
+                        ValueError,
                 ) as exc:
                     await send_json(
                         {
@@ -1136,8 +1157,8 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     )
                     continue
                 if (
-                    expected_audio_bytes is not None
-                    and expected_audio_bytes > settings.hardware_voice_max_audio_bytes
+                        expected_audio_bytes is not None
+                        and expected_audio_bytes > settings.hardware_voice_max_audio_bytes
                 ):
                     await send_json(
                         {
@@ -1216,7 +1237,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             # WebSocket/TCP 本身可靠，但大小校验能发现固件声明错误、录音缓冲截断
             # 或错误地把其他二进制数据混入本轮。
             if expected_audio_bytes is not None and expected_audio_bytes != len(
-                audio_data
+                    audio_data
             ):
                 await send_json(
                     {
