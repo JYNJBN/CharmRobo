@@ -23,8 +23,11 @@ docs/
 uploads/
 
 # Milvus 运行数据，不提交 Git
-# 注意真实路径是 infra/volumes/（infra/docker-compose.yml 里的 DOCKER_VOLUME_DIRECTORY 默认 .）
+# 两种目录布局都要覆盖：
+#   服务器：infra/volumes/          （在 infra/ 下执行 compose）
+#   本地：  infra/milvus/volumes/   （Milvus 官方 compose 的目录结构）
 infra/volumes/
+infra/milvus/volumes/
 
 # 部署前的配置文件备份
 backups/
