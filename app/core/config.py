@@ -38,14 +38,17 @@ class Settings(BaseSettings):
     ark_deepseek_model: str | None = None
     ark_doubao_model: str
     # 硬件语音链路固定使用的大模型，不随智能体的 model_key 变化，也不影响
-    # 小程序端到端模型配置。当前走火山方舟的 DeepSeek-V4.1-Flash（深度思考
-    # 模型，调用处会显式 thinking=disabled）。
+    # 小程序端到端模型配置。当前走阿里百炼（千问）的 qwen3.7-flash ——
+    # 供应商（api_key / base_url）在 api/v1/hardware_voice.py 里固定为 qwen。
+    # ⚠️ 换供应商时下面两个值必须跟着换：model 必须是「目标那一家」托管的
+    #    Model ID，否则会 InvalidEndpointOrModel.NotFound（方舟不托管千问，
+    #    百炼也不托管 DeepSeek，反之亦然）。
     # 注意：这里刻意**不做** HARDWARE_DOUBAO_MODEL 旧变量名兼容。若服务器 .env
     # 里还留着旧变量，让它被忽略才对——否则旧值会盖掉新模型，表现为"改了没生效"。
-    hardware_llm_model: str = "deepseek-v4-1-flash-260910"
+    hardware_llm_model: str = "qwen3.7-flash"
     # 写进系统提示词的模型名。用户问"你是什么模型"时模型会照这个回答，
     # 换硬件模型时这里要同步改，否则会答成上一代模型。
-    hardware_llm_label: str = "DeepSeek-V4.1-Flash"
+    hardware_llm_label: str = "通义千问"
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str = (
         "https://dashscope.aliyuncs.com/compatible-mode/v1"

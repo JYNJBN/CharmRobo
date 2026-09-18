@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from time import perf_counter
 
 from fastapi import APIRouter, WebSocket
+from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.websockets import WebSocketDisconnect
 
@@ -264,17 +265,27 @@ async def _load_hardware_session(
         # 将数据库里的 model_key 解析成现有 LLM 层可直接使用的模型配置。
         # 这里只是拿一份基线配置，硬件链路随后会整体覆盖成专属模型。
         model = resolve_model(agent.model_key)
-        # 硬件链路固定走火山方舟 + 硬件专属模型，故意不看智能体的 model_key：
-        # 否则用户在智能体里把模型切成千问/豆包后，硬件链路会静默跟着切换。
-        # 复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
+        # 硬件链路固定走阿里百炼（千问）+ 硬件专属模型，故意不看智能体的
+        # model_key：否则用户在智能体里把模型切成豆包/DeepSeek 后，硬件链路会
+        # 静默跟着切换。复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
+        #
+        # ⚠️ 下面三项必须成套改，少改一项就 404：
+        #   api_key / base_url 决定「调哪一家」，model_id 必须是那一家托管的模型。
+        #   例如拿方舟的 base_url 去调 qwen3.7-flash 会直接
+        #   InvalidEndpointOrModel.NotFound（方舟不托管千问，反之亦然）。
         model = {
             **model,
-            "provider": "ark",
-            "api_key": settings.ark_api_key,
-            "base_url": settings.ark_base_url,
+            "provider": "qwen",
+            # qwen_api_key 是可选配置。缺失时给一个空 SecretStr，让
+            # ai.get_model_client 抛出统一提示「未配置 qwen API Key」，
+            # 而不是在这里 AttributeError 崩掉。
+            "api_key": settings.qwen_api_key or SecretStr(""),
+            "base_url": settings.qwen_base_url,
             "model_id": settings.hardware_llm_model,
-            # DeepSeek-V4.1-Flash 默认开深度思考（high），会先产出一大段思考再
-            # 回答：对语音播报既抬高首字延迟，又会吃掉 max_tokens。必须显式关闭。
+            # 千问 flash 系列本身不产出思考过程，这个参数会被百炼忽略（实测不报错）。
+            # 保留它是为了将来切回方舟推理模型时能直接复用——那类模型默认开深度
+            # 思考，会先吐一大段思考再回答，既抬高语音首字延迟又吃掉 max_tokens，
+            # 必须显式关闭。
             "thinking_type": "disabled",
         }
         # 系统提示词里的模型名必须跟真实调用的模型一致，否则用户问
@@ -282,7 +293,7 @@ async def _load_hardware_session(
         model_label = settings.hardware_llm_label
         logger.info(
             "[HARDWARE-VOICE][%s][会话] 硬件模型已固定 "
-            "model=%s label=%s thinking=disabled",
+            "provider=qwen model=%s label=%s thinking=disabled",
             trace_id,
             settings.hardware_llm_model,
             model_label,
