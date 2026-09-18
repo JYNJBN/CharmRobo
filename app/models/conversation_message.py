@@ -49,7 +49,7 @@ class ConversationMessage(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         index=True,

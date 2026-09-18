@@ -57,14 +57,14 @@ class User(Base):
 
     # 插入时自动生成
     create_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
 
     # 插入时生成，更新时自动修改
     update_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,

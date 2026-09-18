@@ -52,17 +52,17 @@ class UserDevice(Base):
         comment="用户对设备的角色：owner 或 member",
     )
     bind_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         comment="绑定时间",
     )
     unbind_time: Mapped[datetime | None] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         comment="解绑时间",
     )
     update_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,

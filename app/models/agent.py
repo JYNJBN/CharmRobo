@@ -56,13 +56,13 @@ class Agent(Base):
         comment="fork 自哪个模板"
     )
     create_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         comment="创建时间"
     )
     update_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         onupdate=func.now(),

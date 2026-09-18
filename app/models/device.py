@@ -60,7 +60,7 @@ class Device(Base):
         comment="设备密钥版本",
     )
     secret_updated_time: Mapped[datetime | None] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         comment="设备密钥最后更新时间",
     )
     status: Mapped[int] = mapped_column(
@@ -71,18 +71,18 @@ class Device(Base):
         comment="设备状态：1 正常，0 禁用",
     )
     last_online_time: Mapped[datetime | None] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         comment="最近一次上线时间",
     )
 
     create_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         comment="创建时间",
     )
     update_time: Mapped[datetime] = mapped_column(
-        DateTime,
+        DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
