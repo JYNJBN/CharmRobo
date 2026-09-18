@@ -1,6 +1,8 @@
-from datetime import date, datetime
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.common import UTCDateTime
 
 
 class UserCreate(BaseModel):
@@ -38,8 +40,8 @@ class UserResponse(BaseModel):
     gender: int = 0
     birthday: date | None
     ip_location: str | None
-    create_time: datetime
-    update_time: datetime
+    create_time: UTCDateTime
+    update_time: UTCDateTime
 
     # 允许 Pydantic 直接从 SQLAlchemy User 对象读取属性。
     model_config = ConfigDict(from_attributes=True)
