@@ -1,0 +1,25 @@
+# docker compose 叠加文件（override）：只覆盖 backend 的 command。
+#
+# 用途：只重启后端，但【跳过数据库迁移】。
+# compose.prod.yml 里 backend 的 command 是
+#   alembic upgrade head && exec uvicorn ...
+# 本文件把 command 换成纯 uvicorn，不跑迁移。
+#
+# 用法：
+#   docker compose -f compose.prod.yml -f compose.backend-only.yml up -d backend
+#
+# 适用场景：只是改了业务代码要重启，确认没有新迁移需要执行时，
+# 可以省掉每次启动的 alembic 检查。
+# 注意：后加的 -f 文件会覆盖前一个文件中同名的字段。
+services:
+  backend:
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"

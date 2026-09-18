@@ -54,7 +54,20 @@ services:
     networks:
       - default
       - nginx_net
-    build: .
+
+    # network: host 让构建期间的 RUN 能直接访问宿主机网络。
+    # 两个 build args 只作用于「容器内的 RUN」（pip / uv），
+    # 不影响 registry 拉取层 —— 那一层走的是 daemon 级代理
+    # (/etc/systemd/system/docker.service.d/override.conf)。
+    # 当前 Dockerfile 已全部改用腾讯云源，构建不再需要代理，留空即可；
+    # 需要时用 build.sh 探测隧道后自动传入。
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-}
+
     container_name: charming-backend
     restart: unless-stopped
 
@@ -64,6 +77,10 @@ services:
     # 容器内部不能使用 127.0.0.1 连接其他容器。
     # postgres 和 redis 是上面的服务名称。
     environment:
+      # ⚠️ TZ 只影响【日志展示】和容器内 datetime.now() 的结果，
+      # 不决定存库口径。存库统一为 UTC，由 app/utils/tools.py 的
+      # local_now() 显式保证（历史教训见 2026-09-17/18 工作日志）。
+      TZ: Asia/Shanghai
       DEBUG: "false"
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
@@ -74,6 +91,10 @@ services:
 
     volumes:
       - uploads_data:/app/uploads
+      # 注意：Linux 下 TZ 环境变量优先级高于 /etc/localtime，
+      # 这两个挂载不是必需项（容器内 /etc/localtime 实测仍是镜像原装的 UTC 软链）。
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
 
     depends_on:
       postgres:
@@ -85,6 +106,8 @@ services:
       - "8000"
 
     # 每次容器启动，先执行未执行的数据库迁移，再启动 FastAPI。
+    # 只想重启、不想跑迁移时，叠加 compose.backend-only.yml：
+    #   docker compose -f compose.prod.yml -f compose.backend-only.yml up -d backend
     command:
       - sh
       - -c
@@ -95,12 +118,11 @@ services:
         --port 8000
         --proxy-headers
         --forwarded-allow-ips "*"
+
 volumes:
   postgres_data:
   redis_data:
   uploads_data:
-  caddy_data:
-  caddy_config:
 
 networks:
   default:

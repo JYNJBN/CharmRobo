@@ -23,7 +23,11 @@ docs/
 uploads/
 
 # Milvus 运行数据，不提交 Git
-infra/milvus/volumes/
+# 注意真实路径是 infra/volumes/（infra/docker-compose.yml 里的 DOCKER_VOLUME_DIRECTORY 默认 .）
+infra/volumes/
+
+# 部署前的配置文件备份
+backups/
 
 # 原始音乐素材仅在本地转换；线上运行只需要已归一化的 music/。
 music_raw/
