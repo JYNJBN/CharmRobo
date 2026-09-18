@@ -1,8 +1,7 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
-
-from app.schemas.common import UTCDateTime
 
 
 class CreateTicketRequest(BaseModel):
@@ -78,9 +77,9 @@ class UserDeviceResponse(BaseModel):
     firmware_version: str | None
     hardware_version: str | None
     status: int
-    last_online_time: UTCDateTime | None
+    last_online_time: datetime | None
 
     # user_device字段
     alias: str | None
     role: Literal["owner", "member"]
-    bind_time: UTCDateTime
+    bind_time: datetime
