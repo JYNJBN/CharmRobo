@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     qwen_audio_realtime_ws_url: str | None = None
     qwen_audio_realtime_model: str = "qwen-audio-3.0-realtime-plus"
     qwen_audio_realtime_voice: str = "longanqian"
+    # Qwen Audio 3.0/3.1 支持会话级联网搜索，由模型按问题自主决定是否检索。
+    qwen_audio_realtime_enable_search: bool = True
     qwen_audio_realtime_max_history_turns: int = Field(
         default=20,
         ge=1,
@@ -192,6 +194,57 @@ class Settings(BaseSettings):
     milvus_summary_collection: str = "conversation_summary_v1"
     # Milvus 服务配置
     milvus_uri: str = "http://127.0.0.1:19530"
+
+    # 配置独立的知识库向量集合
+    milvus_knowledge_collection: str = "knowledge_chunks_v1"
+    knowledge_parser_version: str = "manual-v1"
+    knowledge_chunker_version: str = "element-overlap-v1"
+    knowledge_embedding_profile: str = "kb-text-v1"
+    knowledge_chunk_target_chars: int = 800
+    knowledge_chunk_overlap_chars: int = 100
+    knowledge_retrieval_top_k: int = 5
+    # 知识库 COS 存储配置
+    knowledge_storage_backend: str = "cos"
+
+    cos_bucket: str | None = None
+    cos_region: str | None = None
+    cos_secret_id: SecretStr | None = None
+    cos_secret_key: SecretStr | None = None
+
+    # 使用临时凭证时配置；使用服务端长期凭证时留空。
+    cos_security_token: SecretStr | None = None
+    knowledge_cos_incoming_prefix: str = "incoming/"
+    knowledge_cos_source_prefix: str = "knowledge/"
+
+    knowledge_upload_form_ttl_seconds: int = Field(
+        default=300,
+        gt=0,
+    )
+    knowledge_upload_session_seconds: int = Field(
+        default=1800,
+        gt=0,
+    )
+    knowledge_cos_download_url_ttl_seconds: int = Field(
+        default=120,
+        gt=0,
+    )
+    knowledge_cos_storage_class: str = Field(
+        default="STANDARD",
+        pattern=r"^(STANDARD|MAZ_STANDARD)$",
+    )
+    knowledge_max_file_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        gt=0,
+    )
+    knowledge_max_documents_per_base: int = Field(
+        default=10,
+        gt=0,
+    )
+    knowledge_max_base_content_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        gt=0,
+    )
+    knowledge_file_parser_version: str = "docx-v1"
 
     @property
     def alembic_database_url(self) -> str:

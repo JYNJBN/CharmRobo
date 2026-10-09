@@ -11,3 +11,13 @@ __pycache__
 # 运行时用 Docker Volume 保存
 uploads
 
+# 本地测试输出、数据库数据和备份不属于应用镜像。
+.tmp
+outputs
+tests
+docs
+backups
+infra/volumes
+infra/milvus/volumes
+.env.*
+

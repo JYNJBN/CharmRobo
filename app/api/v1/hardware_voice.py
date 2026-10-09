@@ -652,6 +652,7 @@ async def _run_hardware_turn(
                 # run_turn 会退回普通流式对话，行为与改造前完全一致。
                 tools=hardware_tools,
                 execute_tool=execute_hardware_tool,
+                enable_knowledge_retrieval=True,
         ):
             check_cancelled()
             if first_llm_delta_at is None:

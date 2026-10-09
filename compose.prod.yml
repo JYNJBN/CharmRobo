@@ -51,6 +51,7 @@ services:
       retries: 20
 
   backend:
+    image: charming-backend:local
     networks:
       - default
       - nginx_net
@@ -83,7 +84,9 @@ services:
       TZ: Asia/Shanghai
       DEBUG: "false"
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
       REDIS_HOST: redis
+      MILVUS_URI: ${MILVUS_URI:-http://milvus-standalone:19530}
       UPLOAD_DIR: /app/uploads
 
       # 替换成你的真实 HTTPS 域名。
@@ -105,6 +108,17 @@ services:
     expose:
       - "8000"
 
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
     # 每次容器启动，先执行未执行的数据库迁移，再启动 FastAPI。
     # 只想重启、不想跑迁移时，叠加 compose.backend-only.yml：
     #   docker compose -f compose.prod.yml -f compose.backend-only.yml up -d backend
@@ -118,6 +132,33 @@ services:
         --port 8000
         --proxy-headers
         --forwarded-allow-ips "*"
+
+  knowledge-worker:
+    image: charming-backend:local
+    container_name: charming-knowledge-worker
+    restart: unless-stopped
+    # 首次部署先迁移数据库、初始化 Milvus 集合，再显式启动 Worker。
+    profiles: [knowledge]
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      DEBUG: "false"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: redis
+      MILVUS_URI: ${MILVUS_URI:-http://milvus-standalone:19530}
+    command:
+      - python
+      - -m
+      - app.workers.knowledge_ingest_worker
+    networks:
+      - default
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

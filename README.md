@@ -17,12 +17,12 @@ Charming 微信小程序和硬件设备的 FastAPI 后端。
 |---|---|
 | FastAPI | HTTP API 和后续 WebSocket 服务 |
 | Pydantic | 请求校验、响应结构和配置读取 |
-| SQLAlchemy 2.x Async | 异步操作 MySQL |
+| SQLAlchemy 2.x Async | 异步操作 PostgreSQL |
 | Alembic | 数据库表结构迁移 |
-| MySQL 8.4 | 永久保存用户、设备和绑定关系 |
+| PostgreSQL 16（含 pgvector） | 永久保存用户、设备和绑定关系，并提供向量扩展能力 |
 | Redis 7 | 保存绑定码、在线状态等临时数据 |
 | PyJWT | 用户 Access Token |
-| Docker Compose | 本地启动 MySQL 和 Redis |
+| Docker Compose | 本地启动 PostgreSQL 和 Redis |
 | uv | Python、虚拟环境和依赖管理 |
 | Ruff | Python 静态检查 |
 
@@ -79,7 +79,7 @@ cml_websit_backend/
 ├── .env                           # 本地真实配置，不提交 Git
 ├── .env.example                   # 环境变量示例
 ├── alembic.ini                    # Alembic 命令配置
-├── docker-compose.yml             # MySQL、Redis 容器
+├── docker-compose.yml             # PostgreSQL、Redis 容器
 ├── pyproject.toml                 # 项目信息和依赖
 ├── uv.lock                        # 锁定后的依赖版本
 └── README.md                      # 本文档
@@ -214,8 +214,8 @@ hardware_version（可选）
 
 - SQLAlchemy 查询和写入；
 - 业务规则；
-- MySQL 事务；
-- Redis 和 MySQL 组合操作；
+- PostgreSQL 事务；
+- Redis 和 PostgreSQL 组合操作；
 - 调用第三方 Integration。
 
 固定调用方向：
@@ -255,9 +255,9 @@ Alembic 负责数据库结构版本，不负责日常数据查询。
 
 ---
 
-## MySQL、Redis 和进程内存分工
+## PostgreSQL、Redis 和进程内存分工
 
-### MySQL：永久数据
+### PostgreSQL：永久数据
 
 ```text
 用户
@@ -285,7 +285,7 @@ Alembic 负责数据库结构版本，不负责日常数据查询。
 短生命周期运行对象
 ```
 
-Redis 不是 MySQL 的替代品。
+Redis 不是 PostgreSQL 的替代品。
 
 ---
 
@@ -303,7 +303,7 @@ Redis 不是 MySQL 的替代品。
 7. 硬件直接请求 POST /api/v1/device/bootstrap
 8. 后端只保存 device_secret_hash
 9. 后端同一事务写入 device + user_device
-10. MySQL 成功后删除 Redis Ticket
+10. PostgreSQL 成功后删除 Redis Ticket
 ```
 
 小程序不读取、不保存 `device_secret`。
@@ -366,11 +366,11 @@ OpenAPI:    http://127.0.0.1:8001/openapi.json
 APP_NAME=CharmingDeviceAPI
 DEBUG=true
 
-MYSQL_HOST=127.0.0.1
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=change_me
-MYSQL_DATABASE=charming
+POSTGRES_HOST=127.0.0.1
+POSTGRES_PORT=5432
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=change_me
+POSTGRES_DATABASE=charming
 
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
@@ -391,8 +391,8 @@ UPLOAD_DIR=uploads
 
 - `.env` 包含真实密钥，不能提交 Git；
 - `.env.example` 只能放示例值；
-- FastAPI 在电脑本机运行时使用 `MYSQL_HOST=127.0.0.1`、`REDIS_HOST=127.0.0.1`；
-- 如果 FastAPI 也放进 Compose，Host 应改成 Compose 服务名 `mysql` 和 `redis`。
+- FastAPI 在电脑本机运行时使用 `POSTGRES_HOST=127.0.0.1`、`REDIS_HOST=127.0.0.1`；
+- 如果 FastAPI 也放进 Compose，Host 应改成 Compose 服务名 `postgres` 和 `redis`。
 
 ---
 
@@ -404,10 +404,10 @@ UPLOAD_DIR=uploads
 uv sync
 ```
 
-### 2. 启动 MySQL 和 Redis
+### 2. 启动 PostgreSQL 和 Redis
 
 ```powershell
-docker compose up -d mysql redis
+docker compose up -d postgres redis
 ```
 
 查看状态：
@@ -598,7 +598,7 @@ uv run ruff check app tests --fix
 ```text
 Ruff 通过
 Alembic 处于 head
-MySQL 和 Redis 健康
+PostgreSQL 和 Redis 健康
 Swagger 请求响应正确
 .env 未被 Git 跟踪
 ```
@@ -633,6 +633,90 @@ app/
 认证成功后再允许心跳、状态上报、音频、STT、AI 和 TTS。
 
 ---
+
+## 知识库首次部署
+
+API 和知识库 Worker 共用 `charming-backend:local` 镜像。Worker 的入口是
+`python -m app.workers.knowledge_ingest_worker`，通过 `knowledge` profile 显式启用。
+初次部署时先准备 PostgreSQL 表和 Milvus 集合，再启动 Worker。
+
+### 1. 配置服务器环境
+
+同步完整的 `app/`、`scripts/init_knowledge_milvus.py`、`pyproject.toml`、`uv.lock`
+以及所有 `app/alembic/versions/` 迁移文件。在服务器原来的项目目录执行后续命令。
+
+服务器 `.env` 保留已有数据库和模型密钥，并补全 `.env.example` 的知识库配置。
+Embedding 模型、维度与已使用的集合保持一致。密钥不提交 Git，也不复制进镜像。
+
+如果 Milvus 使用本项目 `infra/compose.milvus.prod.yml` 部署，服务器配置为：
+
+```dotenv
+MILVUS_URI=http://milvus-standalone:19530
+MILVUS_KNOWLEDGE_COLLECTION=knowledge_chunks_v1
+KNOWLEDGE_FILE_PARSER_VERSION=docx-v1
+KNOWLEDGE_CHUNKER_VERSION=element-overlap-v1
+```
+
+填写私有 COS 桶、地域和密钥；多 AZ 桶使用 `KNOWLEDGE_COS_STORAGE_CLASS=MAZ_STANDARD`。
+容器内部使用 Milvus 的服务地址，不能把本地开发的 `127.0.0.1` 原样用于其他容器。
+
+### 2. 构建镜像与迁移数据库
+
+```bash
+docker compose -f compose.prod.yml up -d postgres redis
+docker compose -f compose.prod.yml build backend
+docker compose -f compose.prod.yml run --rm --no-deps backend python -c "from app.parsers.docling_parser import parse_docling_file; print('Docling import OK')"
+```
+
+升级前备份现有 PostgreSQL：
+
+```bash
+mkdir -p backups
+docker compose -f compose.prod.yml exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "backups/before_knowledge_$(date +%Y%m%d_%H%M%S).dump"
+```
+
+检查并应用迁移：
+
+```bash
+docker compose -f compose.prod.yml run --rm --no-deps backend alembic current
+docker compose -f compose.prod.yml run --rm --no-deps backend alembic upgrade head
+docker compose -f compose.prod.yml run --rm --no-deps backend alembic current
+```
+
+当前知识库迁移终点为 `a5e3b9226758`。服务器执行已有迁移，不重新生成迁移文件。
+
+### 3. 初始化 Milvus 集合
+
+Milvus 尚未部署时，先执行：
+
+```bash
+docker compose -f infra/compose.milvus.prod.yml up -d
+```
+
+等待 Milvus 健康后，初始化知识库集合：
+
+```bash
+docker compose -f compose.prod.yml run --rm --no-deps backend python -m scripts.init_knowledge_milvus
+docker compose -f compose.prod.yml run --rm --no-deps backend python -c "from app.core.config import settings; from pymilvus import MilvusClient; c=MilvusClient(uri=settings.milvus_uri); c.load_collection(collection_name=settings.milvus_knowledge_collection); print(c.get_load_state(collection_name=settings.milvus_knowledge_collection))"
+```
+
+初始化脚本在集合已存在时打印结构，不会覆盖已有集合；检查向量维度与服务器的
+`EMBEDDING_DIMENSION` 一致，再继续部署。
+
+### 4. 启动并验证
+
+```bash
+docker compose -f compose.prod.yml up -d --wait --wait-timeout 180 backend
+docker compose -f compose.prod.yml up -d knowledge-worker
+docker compose -f compose.prod.yml --profile knowledge ps
+docker compose -f compose.prod.yml logs --tail=100 backend knowledge-worker
+```
+
+Worker 不开放 HTTP 端口，启动前等待 PostgreSQL 和 API 健康。上传一份小 DOCX，完成
+`upload-complete` 后确认任务变为 `succeeded`、文档变为 `ready`，再验证知识检索。
+
+后续在服务器执行 `bash build.sh` 更新代码。脚本构建共享镜像，暂停正在运行的 Worker，
+等待 API 迁移及健康检查成功后恢复 Worker。第一次部署或主动停止的 Worker 不会自动启动。
 
 ## 当前待办
 

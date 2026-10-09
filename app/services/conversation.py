@@ -24,6 +24,12 @@ from app.integrations.ai import (
 from app.integrations.embedding import embed_text
 from app.integrations.milvus import search_summaries
 from app.schemas.Model import ModelRegistryObject
+from app.core.database import AsyncSessionLocal
+from app.services.conversation_references import (
+    KNOWLEDGE_REFERENCE_RULES,
+    format_knowledge_context,
+)
+from app.services.knowledge_retrieval_service import retrieve_agent_knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +96,7 @@ async def run_turn(
         model_label: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         execute_tool: Callable[[str, Any], Awaitable[str | None]] | None = None,
+        enable_knowledge_retrieval: bool = False,
 ) -> AsyncIterator[str]:
     """功能说明：执行一轮对话，流式产出 LLM 文字增量。
 
@@ -107,6 +114,11 @@ async def run_turn(
     文字向量化，再在 Milvus 里检索该用户 / 该智能体的 TopK=3 条对话摘要，拼成
     memory_context 作为 system 消息插入 messages 开头。检索失败或没有命中都只记日志，
     不影响本轮对话；缺 user_id / agent_id 时直接跳过。
+
+    硬件级联知识库检索（显式启用）：硬件路由设置 enable_knowledge_retrieval 后，
+    使用同一个问题向量查询当前用户 / 智能体有权限使用的知识库，最多等待 3 秒。
+    命中资料只放进本轮临时 messages，不写入会话历史；超时或检索失败时继续原回答。
+    其他 run_turn 调用方默认关闭这项检索。
 
     工具调用（已实现）：同时传入 tools 与 execute_tool 时改走 stream_chat_with_tools，
     工具定义随 messages 一起发给模型，模型在**同一次**调用里决定直接回答还是发起
@@ -133,6 +145,7 @@ async def run_turn(
         *history,
         {"role": "user", "content": user_text},
     ]
+    query_vector: list[float] | None = None
     if user_id is not None and agent_id is not None:
         memory_started_at = perf_counter()
         logger.info(
@@ -228,6 +241,69 @@ async def run_turn(
             trace_id,
         )
 
+    if enable_knowledge_retrieval:
+        if user_id is None or agent_id is None:
+            logger.info(
+                "[知识库][%s] 跳过：硬件会话缺少已认证的用户或智能体",
+                trace_id,
+            )
+        elif query_vector is None:
+            # 与历史记忆共用本轮问题向量，不因记忆检索失败重复计费。
+            logger.info(
+                "[知识库][%s] 跳过：本轮问题向量不可用",
+                trace_id,
+            )
+        else:
+            started_at = perf_counter()
+
+            async def load_knowledge() -> list:
+                async with AsyncSessionLocal() as knowledge_db:
+                    return await retrieve_agent_knowledge(
+                        knowledge_db,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        query=user_text,
+                        query_vector=query_vector,
+                    )
+
+            retrieval_task = asyncio.create_task(load_knowledge())
+            try:
+                done, _ = await asyncio.wait({retrieval_task}, timeout=3.0)
+                if retrieval_task not in done:
+                    logger.warning(
+                        "[知识库][%s] 检索超时，上限=3秒；继续原对话",
+                        trace_id,
+                    )
+                else:
+                    hits = retrieval_task.result()
+                    reference_context = format_knowledge_context(hits)
+                    if reference_context:
+                        messages.insert(
+                            -1,
+                            {
+                                "role": "user",
+                                "content": reference_context,
+                            },
+                        )
+                    logger.info(
+                        "[知识库][%s] 检索完成 user_id=%s agent_id=%s "
+                        "命中=%d 耗时=%.3f秒",
+                        trace_id,
+                        user_id,
+                        agent_id,
+                        len(hits),
+                        perf_counter() - started_at,
+                    )
+            except Exception:
+                logger.exception(
+                    "[知识库][%s] 检索失败；继续原对话",
+                    trace_id,
+                )
+            finally:
+                if not retrieval_task.done():
+                    retrieval_task.cancel()
+                await asyncio.gather(retrieval_task, return_exceptions=True)
+
     # 记忆检索结束后才真正发起 LLM 请求；这条日志用于把“检索耗时”和
     # “LLM 首字/完整输出耗时”分开统计。
     # 有 model_label 时把它注入系统提示词，模型才能回答"你现在用的什么模型"；
@@ -237,6 +313,8 @@ async def run_turn(
         persona=agent_system_prompt,
         agent_name=agent_name,
     )
+    if enable_knowledge_retrieval:
+        instructions += "\n" + KNOWLEDGE_REFERENCE_RULES
     logger.info(
         "[对话][LLM][%s] 开始请求上游 conversation_id=%s "
         "消息数=%d",

@@ -101,6 +101,12 @@ def build_session_update_event(
             "output_audio_format": "pcm",
             "turn_detection": None,
             "max_history_turns": settings.qwen_audio_realtime_max_history_turns,
+            "enable_search": settings.qwen_audio_realtime_enable_search,
+            **(
+                {"search_options": {"enable_source": True}}
+                if settings.qwen_audio_realtime_enable_search
+                else {}
+            ),
         },
     }
 
@@ -133,13 +139,23 @@ def build_history_item(
     }
 
 
-def build_context_item(text: str) -> dict[str, object]:
-    """构造本轮检索结果的 system 上下文项。"""
+def build_context_item(
+        text: str,
+        *,
+        previous_item_id: str | None = None,
+) -> dict[str, Any]:
+    """构造显式 system 消息；替换时先插在旧 system 后，再删除旧项。
 
-    return {
+    为避开当前 3.0 Plus 搜索链路中已复现的错误，保持单条 system 位于
+    对话开头，初始化不再同时使用非空 session.instructions。
+    每条消息有独立 ID，用于等待确认及替换。
+    """
+
+    event: dict[str, Any] = {
         "type": "conversation.item.create",
         "event_id": f"memory_{uuid.uuid4().hex[:12]}",
         "item": {
+            "id": f"context_{uuid.uuid4().hex[:12]}",
             "type": "message",
             "role": "system",
             "content": [
@@ -149,6 +165,19 @@ def build_context_item(text: str) -> dict[str, object]:
                 }
             ],
         },
+    }
+    if previous_item_id is not None:
+        event["previous_item_id"] = previous_item_id
+    return event
+
+
+def build_context_delete_event(item_id: str) -> dict[str, object]:
+    """只删除本连接上一次创建的 system 上下文，不影响数据库记录。"""
+
+    return {
+        "type": "conversation.item.delete",
+        "event_id": f"context_delete_{uuid.uuid4().hex[:12]}",
+        "item_id": item_id,
     }
 
 
@@ -214,17 +243,57 @@ def parse_qwen_audio_event(raw: object) -> dict[str, Any]:
     return event
 
 
-def qwen_audio_error_detail(event: dict[str, Any]) -> str:
-    """提取 Qwen 错误事件中的可读信息。"""
+def qwen_audio_error_info(event: dict[str, Any]) -> dict[str, Any]:
+    """提取 error 或失败 response.done 的诊断字段，不记录音频和上下文。"""
 
+    response = event.get("response")
+    response = response if isinstance(response, dict) else {}
+    status_details = response.get("status_details")
+    status_details = status_details if isinstance(status_details, dict) else {}
     error = event.get("error")
-    if isinstance(error, dict):
-        message = error.get("message") or error.get("code")
-        if isinstance(message, str):
-            return message
+    if not isinstance(error, dict):
+        error = status_details.get("error") or response.get("error")
+    error = error if isinstance(error, dict) else {}
+    fields = {
+        "event_id": event.get("event_id"),
+        "response_id": response.get("id"),
+        "status": response.get("status"),
+        "error_type": error.get("type") or status_details.get("type"),
+        "error_code": error.get("code"),
+        "error_message": error.get("message"),
+        "error_param": error.get("param"),
+        "request_event_id": error.get("event_id"),
+        "reason": status_details.get("reason"),
+    }
+    return {
+        key: value[:500] if isinstance(value, str) else value
+        for key, value in fields.items()
+        if isinstance(value, (str, int, float, bool))
+    }
+
+
+def qwen_audio_error_detail(event: dict[str, Any]) -> str:
+    """兼容读取独立错误和失败回复中的可读信息。"""
+
+    info = qwen_audio_error_info(event)
+    message = info.get("error_message") or info.get("error_code") or info.get("reason")
+    if isinstance(message, str):
+        return message
     message = event.get("message") or event.get("detail")
     if isinstance(message, str):
         return message
     if message is not None:
         return json.dumps(message, ensure_ascii=False)[:500]
     return "Qwen Audio 返回未知错误"
+
+
+def qwen_audio_error_is_fatal(event: dict[str, Any]) -> bool:
+    """server_error 会终止会话；兼容上游遗漏 type 的内部错误。"""
+
+    info = qwen_audio_error_info(event)
+    return (
+        info.get("error_type") == "server_error"
+        or str(info.get("error_code") or "").lower()
+        in {"internal_error", "internal_server_error", "internalservererror"}
+        or qwen_audio_error_detail(event).lower().startswith("internal service error")
+    )

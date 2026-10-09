@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  构建并重启 backend（生产环境一键脚本）
+#  构建并更新 backend，以及已经运行的知识库 Worker
 #
 #  - 代理隧道在线  -> 构建时带上代理（HTTP_PROXY=127.0.0.1:17890）
 #  - 隧道不可用    -> 自动回退为直连构建，不再阻塞
@@ -40,8 +40,21 @@ fi
 echo "[build] docker compose build backend ..."
 docker compose -f "$COMPOSE" build backend
 
-echo "[build] docker compose up -d backend ..."
-docker compose -f "$COMPOSE" up -d backend
+# 构建完成后暂停已有 Worker，避免迁移期间领取任务。
+# 未启用或已经停止的 Worker 不会由更新脚本自动启动。
+WORKER_WAS_RUNNING="$(docker compose -f "$COMPOSE" --profile knowledge ps --status running -q knowledge-worker)"
+if [ -n "$WORKER_WAS_RUNNING" ]; then
+    echo "[build] 暂停知识库 Worker，准备更新数据库和 API ..."
+    docker compose -f "$COMPOSE" stop knowledge-worker
+fi
+
+echo "[build] 更新 backend 并等待健康检查 ..."
+docker compose -f "$COMPOSE" up -d --wait --wait-timeout 180 backend
+
+if [ -n "$WORKER_WAS_RUNNING" ]; then
+    echo "[build] 使用新镜像恢复知识库 Worker ..."
+    docker compose -f "$COMPOSE" up -d knowledge-worker
+fi
 
 echo "[build] 完成，当前状态："
-docker compose -f "$COMPOSE" ps
+docker compose -f "$COMPOSE" --profile knowledge ps

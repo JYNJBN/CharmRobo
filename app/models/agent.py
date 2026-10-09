@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, String, text, Boolean, DateTime, func, Integer
+from sqlalchemy import BigInteger, String, text, Boolean, DateTime, func, Integer, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -8,6 +8,17 @@ from app.core.database import Base
 
 class Agent(Base):
     __tablename__ = "agent"
+    __table_args__ = (
+        Index(
+            "uq_agent_device_source_active",
+            "device_id",
+            "source_agent_id",
+            unique=True,
+            postgresql_where=text(
+                "source_agent_id IS NOT NULL AND deleted = 0"
+            ),
+        ),
+    )
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,

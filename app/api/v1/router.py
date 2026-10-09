@@ -8,6 +8,7 @@ from app.api.v1.device import (
     user_device_router,
 )
 from app.api.v1.duplex_voice import router as duplex_voice_router
+from app.api.v1.knowledge import router as knowledge_router
 from app.api.v1.qwen_audio_voice import router as qwen_audio_voice_router
 from app.api.v1.upload import router as upload_router
 from app.api.v1.users import router as users_router
@@ -36,6 +37,11 @@ api_router.include_router(
     agent_router,
     dependencies=[Depends(get_current_user_id)],
 )
+api_router.include_router(
+    knowledge_router,
+    dependencies=[Depends(get_current_user_id)],
+)
+
 # create_ticket_api 内部有 CurrentUserId，
 # 所以自身会执行用户 JWT 校验。
 api_router.include_router(user_device_router)
