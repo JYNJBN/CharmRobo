@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 class HardwareQwenError(RuntimeError):
     """设备千问上游、协议或音频错误。"""
 
+    error_code = "hardware_qwen_error"
+    retryable = False
+
+
+class HardwareQwenTimeout(HardwareQwenError):
+    """服务端主动限制等待，不等同于物理网络断开。"""
+
+    def __init__(self, message: str, *, error_code: str, phase: str, retryable: bool):
+        super().__init__(message)
+        self.error_code = error_code
+        self.phase = phase
+        # 只有尚未发出 MP3 时才能安全从新一轮重试；服务端不自动重复播放。
+        self.retryable = retryable
+
 
 @dataclass
 class HardwareQwenResult:
@@ -96,6 +110,10 @@ class HardwareQwenRealtimeSession:
         self._asr_parts: list[str] = []
         self._last_pcm_at: float | None = None
         self._last_mp3_at: float | None = None
+        self._last_event_type = "未返回"
+        self._upstream_session_id = "未返回"
+        self._upstream_response_id = "未返回"
+        self._next_first_audio_wait_log_seconds = 10
         self._marks: dict[str, float] = {"dialogue_start": self.result.started_at}
 
     def _mark(self, name: str, at: float | None = None) -> float:
@@ -179,7 +197,49 @@ class HardwareQwenRealtimeSession:
         while True:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
-                raise HardwareQwenError(f"千问会话等待超时：{self._phase}")
+                first_audio = (
+                    self._response_requested and self.result.output_pcm_bytes == 0
+                )
+                code = (
+                    "upstream_first_audio_timeout"
+                    if first_audio
+                    else "upstream_wait_timeout"
+                )
+                message = (
+                    f"千问生成首段语音超时（等待上限{settings.hardware_qwen_first_response_timeout_seconds:g}秒），请稍后再试"
+                    if first_audio
+                    else f"千问会话等待超时：{self._phase}"
+                )
+                logger.warning(
+                    "[HARDWARE-QWEN][%s][等待超时] error_code=%s 阶段=%s 已收到文字=%d PCM字节=%d 已发MP3=%d 最后事件=%s session_id=%s response_id=%s",
+                    self.trace_id,
+                    code,
+                    self._phase,
+                    len("".join(self._answer_parts or self._text_parts)),
+                    self.result.output_pcm_bytes,
+                    self.result.audio_bytes,
+                    self._last_event_type,
+                    self._upstream_session_id,
+                    self._upstream_response_id,
+                )
+                raise HardwareQwenTimeout(
+                    message,
+                    error_code=code,
+                    phase=self._phase,
+                    retryable=self.result.audio_bytes == 0,
+                )
+            if self._response_requested and self.result.output_pcm_bytes == 0:
+                waited = time.perf_counter() - self._marks["response_requested"]
+                if waited >= self._next_first_audio_wait_log_seconds:
+                    logger.info(
+                        "[HARDWARE-QWEN][%s][等待首音频] 已等=%.1f秒 上限=%.1f秒 已收到文字=%d 最后事件=%s",
+                        self.trace_id,
+                        waited,
+                        settings.hardware_qwen_first_response_timeout_seconds,
+                        len("".join(self._answer_parts or self._text_parts)),
+                        self._last_event_type,
+                    )
+                    self._next_first_audio_wait_log_seconds += 10
             try:
                 raw = await asyncio.wait_for(self._ws.recv(), min(remaining, 1.0))
                 break
@@ -188,6 +248,11 @@ class HardwareQwenRealtimeSession:
         event = json.loads(raw)
         if not isinstance(event, dict):
             raise HardwareQwenError("千问返回的事件不是对象")
+        self._last_event_type = str(event.get("type") or "unknown")
+        if self._last_event_type == "session.created":
+            self._upstream_session_id = str(
+                (event.get("session") or {}).get("id") or "未返回"
+            )
         if event.get("type") == "error":
             raise HardwareQwenError(
                 f"千问上游错误：{json.dumps(event.get('error'), ensure_ascii=False)}"
@@ -528,14 +593,18 @@ class HardwareQwenRealtimeSession:
                 self._mark("response_requested")
                 await self._send("response.create")
                 logger.info(
-                    "[HARDWARE-QWEN][%s][请求回答] 资料更新确认=%sms 录音结束后=%sms enable_search=%s",
+                    "[HARDWARE-QWEN][%s][请求回答] 资料更新确认=%sms 录音结束后=%sms enable_search=%s 首音频上限=%.1f秒",
                     self.trace_id,
                     self._duration("context_update", "context_confirmed"),
                     self._duration("capture_end", "response_requested"),
                     settings.hardware_qwen_realtime_enable_search,
+                    settings.hardware_qwen_first_response_timeout_seconds,
                 )
             elif event_type == "response.created":
                 self._mark("response_created")
+                self._upstream_response_id = str(
+                    (event.get("response") or {}).get("id") or "未返回"
+                )
                 logger.info(
                     "[HARDWARE-QWEN][%s][生成已开始] 请求确认=%sms",
                     self.trace_id,

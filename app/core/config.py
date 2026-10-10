@@ -70,7 +70,8 @@ class Settings(BaseSettings):
     )
     hardware_qwen_connect_timeout_seconds: float = Field(default=12, gt=0)
     hardware_qwen_asr_timeout_seconds: float = Field(default=15, gt=0)
-    hardware_qwen_first_response_timeout_seconds: float = Field(default=15, gt=0)
+    # 从 response.create 到首段 PCM 的固定上限；3.8 的复杂语音生成可能超过 15 秒。
+    hardware_qwen_first_response_timeout_seconds: float = Field(default=45, gt=0)
     hardware_qwen_output_idle_timeout_seconds: float = Field(default=6, gt=0)
     hardware_qwen_capture_timeout_seconds: float = Field(default=90, gt=0)
     hardware_qwen_retrieval_timeout_seconds: float = Field(default=3, gt=0)

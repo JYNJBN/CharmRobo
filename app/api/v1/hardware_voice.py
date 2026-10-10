@@ -1010,6 +1010,8 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 await send_json({
                     "type": "dialogue.error", "req": worker_req,
                     "client_req": worker_client_req, "error": str(exc),
+                    "error_code": getattr(exc, "error_code", "hardware_voice_error"),
+                    "retryable": bool(getattr(exc, "retryable", False)),
                 })
         finally:
             try:

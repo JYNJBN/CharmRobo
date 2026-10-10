@@ -83,6 +83,49 @@ class FakeBridge:
         return 0, ""
 
 
+class DelayedAudioUpstream(FakeUpstream):
+    """文字先到、音频迟到或只返回部分语音的上游。"""
+
+    def __init__(self, delay=0.05, finish=True):
+        super().__init__()
+        self.delay = delay
+        self.finish = finish
+        self.delivery = None
+
+    async def send(self, raw):
+        event = json.loads(raw)
+        if event["type"] != "response.create":
+            return await super().send(raw)
+        self.sent.append(event)
+        self.queue.put_nowait(
+            {"type": "response.created", "response": {"id": "test-response-id"}}
+        )
+        self.queue.put_nowait(
+            {"type": "response.audio_transcript.delta", "delta": "延迟返回的语音。"}
+        )
+
+        async def deliver():
+            await asyncio.sleep(self.delay)
+            self.queue.put_nowait(
+                {
+                    "type": "response.audio.delta",
+                    "delta": base64.b64encode(b"\0" * 100).decode(),
+                }
+            )
+            if self.finish:
+                self.queue.put_nowait(
+                    {"type": "response.done", "response": {"status": "completed"}}
+                )
+
+        self.delivery = asyncio.create_task(deliver())
+
+    async def close(self):
+        if self.delivery is not None and not self.delivery.done():
+            self.delivery.cancel()
+            await asyncio.gather(self.delivery, return_exceptions=True)
+        await super().close()
+
+
 class FakeDevice:
     def __init__(
         self, route=None, turns=1, cancel=False, size=None, audio_format="pcm"
@@ -327,6 +370,91 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await session.aclose()
 
+    async def test_text_first_and_delayed_audio_can_complete_within_limit(self):
+        upstream = DelayedAudioUpstream(delay=0.05)
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="persona",
+            trace_id="delayed",
+            send_audio=AsyncMock(),
+            retrieve_references=AsyncMock(return_value=""),
+        )
+        with (
+            patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)),
+            patch.object(
+                qwen.settings, "hardware_qwen_first_response_timeout_seconds", 0.3
+            ),
+        ):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                result = await asyncio.wait_for(session.wait(), 1)
+                self.assertEqual(result.answer_text, "延迟返回的语音。")
+                self.assertGreaterEqual(
+                    result.timings_ms["response_to_first_pcm_ms"], 40
+                )
+                self.assertGreater(
+                    result.timings_ms["response_to_first_pcm_ms"],
+                    result.timings_ms["response_to_first_text_ms"],
+                )
+            finally:
+                await session.aclose()
+
+    async def test_first_audio_timeout_is_bounded_and_distinct_from_network_error(self):
+        upstream = DelayedAudioUpstream(delay=1)
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="persona",
+            trace_id="bounded",
+            send_audio=AsyncMock(),
+            retrieve_references=AsyncMock(return_value=""),
+        )
+        with (
+            patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)),
+            patch.object(
+                qwen.settings, "hardware_qwen_first_response_timeout_seconds", 0.025
+            ),
+        ):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                with self.assertRaises(qwen.HardwareQwenTimeout) as caught:
+                    await asyncio.wait_for(session.wait(), 1)
+                self.assertEqual(
+                    caught.exception.error_code, "upstream_first_audio_timeout"
+                )
+                self.assertTrue(caught.exception.retryable)
+                self.assertIn("test-response-id", session._upstream_response_id)
+                self.assertEqual(session.result.audio_bytes, 0)
+            finally:
+                await session.aclose()
+
+    async def test_timeout_after_audio_does_not_mark_round_safe_to_replay(self):
+        upstream = DelayedAudioUpstream(delay=0, finish=False)
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="persona",
+            trace_id="partial",
+            send_audio=AsyncMock(),
+            retrieve_references=AsyncMock(return_value=""),
+        )
+        with (
+            patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)),
+            patch.object(
+                qwen.settings, "hardware_qwen_output_idle_timeout_seconds", 0.05
+            ),
+        ):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                with self.assertRaises(qwen.HardwareQwenTimeout) as caught:
+                    await asyncio.wait_for(session.wait(), 1)
+                self.assertEqual(caught.exception.error_code, "upstream_wait_timeout")
+                self.assertFalse(caught.exception.retryable)
+                self.assertGreater(session.result.audio_bytes, 0)
+            finally:
+                await session.aclose()
+
     async def test_commit_changes_receive_timeout(self):
         upstream = FakeUpstream(transcribe=False)
         session = qwen.HardwareQwenRealtimeSession(
@@ -348,11 +476,17 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await session.aclose()
 
-    async def run_gateway(self, device, upstream_status="completed"):
+    async def run_gateway(
+        self, device, upstream_status="completed", upstream_factory=None
+    ):
         connections = []
 
         async def connect(*args, **kwargs):
-            upstream = FakeUpstream(status=upstream_status)
+            upstream = (
+                upstream_factory()
+                if upstream_factory
+                else FakeUpstream(status=upstream_status)
+            )
             connections.append(upstream)
             return upstream
 
@@ -368,6 +502,23 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(gateway.hardware_dialogue_websocket(device), 3)
         return connections, load, persist, refs
+
+    async def test_gateway_reports_timeout_code_without_success_or_persist(self):
+        device = FakeDevice()
+        with patch.object(
+            qwen.settings, "hardware_qwen_first_response_timeout_seconds", 0.025
+        ):
+            connections, _, persist, _ = await self.run_gateway(
+                device, upstream_factory=lambda: DelayedAudioUpstream(delay=1)
+            )
+        persist.assert_not_awaited()
+        self.assertEqual(
+            device.messages[-1]["error_code"], "upstream_first_audio_timeout"
+        )
+        self.assertTrue(device.messages[-1]["retryable"])
+        self.assertEqual(device.completed, 0)
+        self.assertFalse(device.audio)
+        self.assertTrue(connections[0].closed)
 
     async def test_device_two_turns_reload_agent_and_keep_memory(self):
         device = FakeDevice(turns=2)
