@@ -139,7 +139,7 @@ class HardwareSession:
     # 当前智能体对应的会话及其最近若干条短期上下文。
     conversation_id: int
     history_messages: list[dict[str, str]]
-    # resolve_model 解析后的供应商、模型 ID、API 地址和凭据。
+    # 级联回答和后台摘要使用的文字模型；端到端语音模型由实时适配器独立配置。
     model: ModelRegistryObject
     # 给系统提示词和日志使用的人类可读模型名。
     model_label: str
@@ -215,11 +215,12 @@ async def _load_hardware_session(
         device_sn: str,
         *,
         trace_id: str = "unknown",
+        route: str = "cascade",
 ) -> HardwareSession:
     """校验硬件并加载当前智能体、模型和对话历史。
 
     每轮 ``dialogue.start`` 都重新调用，而不是只在 WebSocket 建连时调用。
-    这样用户在长连接存活期间切换智能体或模型，下一轮即可生效，不必让设备
+    这样用户在长连接存活期间切换智能体，人设和历史下一轮即可生效，不必让设备
     断线重连。
 
     校验顺序：设备存在 -> 设备启用 -> 已绑定拥有者 -> 有可用智能体。
@@ -281,7 +282,8 @@ async def _load_hardware_session(
         # 将数据库里的 model_key 解析成现有 LLM 层可直接使用的模型配置。
         # 这里只是拿一份基线配置，硬件链路随后会整体覆盖成专属模型。
         model = resolve_model(agent.model_key)
-        # 硬件链路固定走阿里百炼（千问）+ 硬件专属模型，故意不看智能体的
+        # 级联回答和后台摘要固定走千问文字模型；这不是端到端语音模型。
+        # 此文字配置故意不看智能体的
         # model_key：否则用户在智能体里把模型切成豆包/DeepSeek 后，硬件链路会
         # 静默跟着切换。复制字典而不是修改 MODEL_REGISTRY，避免影响小程序/其他调用方。
         #
@@ -298,22 +300,25 @@ async def _load_hardware_session(
             "api_key": settings.qwen_api_key or SecretStr(""),
             "base_url": settings.qwen_base_url,
             "model_id": settings.hardware_llm_model,
-            # 千问 flash 系列本身不产出思考过程，这个参数会被百炼忽略（实测不报错）。
-            # 保留它是为了将来切回方舟推理模型时能直接复用——那类模型默认开深度
-            # 思考，会先吐一大段思考再回答，既抬高语音首字延迟又吃掉 max_tokens，
-            # 必须显式关闭。
+            # ai 层按供应商将 disabled 转成千问的 enable_thinking=false。
             "thinking_type": "disabled",
         }
         # 系统提示词里的模型名必须跟真实调用的模型一致，否则用户问
         # "你现在用什么模型" 会得到智能体里选的旧模型名。
         model_label = settings.hardware_llm_label
-        logger.info(
-            "[HARDWARE-VOICE][%s][会话] 硬件模型已固定 "
-            "provider=qwen model=%s label=%s thinking=disabled",
-            trace_id,
-            settings.hardware_llm_model,
-            model_label,
-        )
+        if route == "realtime":
+            logger.info(
+                "[HARDWARE-VOICE][%s][会话] route=realtime provider=qwen "
+                "语音模型=%s 默认音色=%s 后台摘要文字模型=%s",
+                trace_id, settings.hardware_qwen_realtime_model,
+                settings.hardware_qwen_realtime_voice, settings.hardware_llm_model,
+            )
+        else:
+            logger.info(
+                "[HARDWARE-VOICE][%s][会话] route=cascade ASR=百度 "
+                "文字模型=%s provider=qwen label=%s TTS=百度 thinking=disabled",
+                trace_id, settings.hardware_llm_model, model_label,
+            )
 
         # 会话按当前智能体复用。切换智能体后会得到另一条 conversation，历史不会
         # 混到旧智能体中。
@@ -1358,6 +1363,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     session = await _load_hardware_session(
                         device_sn,
                         trace_id=request_id,
+                        route=turn_route,
                     )
                 except (
                         HardwareVoiceError,
