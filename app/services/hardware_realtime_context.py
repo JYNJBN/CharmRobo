@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -62,9 +63,18 @@ async def retrieve_hardware_realtime_references(
     async def retrieve() -> str:
         started = asyncio.get_running_loop().time()
         budget = settings.hardware_qwen_retrieval_timeout_seconds
-        query_vector = await asyncio.wait_for(embed_text(query), budget)
+        embedding_started = perf_counter()
+        try:
+            query_vector = await asyncio.wait_for(embed_text(query), budget)
+        finally:
+            logger.info(
+                "[HARDWARE-QWEN][%s][Embedding] 耗时=%dms",
+                trace_id,
+                int((perf_counter() - embedding_started) * 1000),
+            )
 
         async def memory() -> list[str]:
+            memory_started = perf_counter()
             try:
                 results = await asyncio.to_thread(
                     search_summaries,
@@ -94,8 +104,15 @@ async def retrieve_hardware_realtime_references(
             except Exception:
                 logger.exception("[HARDWARE-QWEN][%s][记忆] 检索失败", trace_id)
                 return []
+            finally:
+                logger.info(
+                    "[HARDWARE-QWEN][%s][记忆检索] 耗时=%dms",
+                    trace_id,
+                    int((perf_counter() - memory_started) * 1000),
+                )
 
         async def knowledge() -> str:
+            knowledge_started = perf_counter()
             try:
                 async with AsyncSessionLocal() as db:
                     hits = await retrieve_agent_knowledge(
@@ -110,6 +127,12 @@ async def retrieve_hardware_realtime_references(
             except Exception:
                 logger.exception("[HARDWARE-QWEN][%s][知识库] 检索失败", trace_id)
                 return ""
+            finally:
+                logger.info(
+                    "[HARDWARE-QWEN][%s][知识库检索] 耗时=%dms",
+                    trace_id,
+                    int((perf_counter() - knowledge_started) * 1000),
+                )
 
         # 单项超时不丢弃另一项已完成的结果；超时/取消时回收剩余 Task。
         tasks = [asyncio.create_task(memory()), asyncio.create_task(knowledge())]

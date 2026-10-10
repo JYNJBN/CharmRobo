@@ -24,6 +24,7 @@ from websockets.exceptions import WebSocketException
 
 from app.core.config import settings
 from app.integrations.hardware_mp3_bridge import PcmToCiMp3Bridge
+from app.utils.tools import BEIJING_TIMEZONE, build_current_time_context, local_now
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class HardwareQwenResult:
     mp3_output_max_gap_ms: int = 0
     finish_reason: str = ""
     search_count: int | None = None
+    timings_ms: dict[str, int] = field(default_factory=dict)
 
 
 class HardwareQwenRealtimeSession:
@@ -73,7 +75,7 @@ class HardwareQwenRealtimeSession:
         self._commands: asyncio.Queue[tuple[str, bytes | None]] = asyncio.Queue(
             settings.hardware_qwen_queue_size
         )
-        self._mp3: asyncio.Queue[bytes | None] = asyncio.Queue(
+        self._mp3: asyncio.Queue[tuple[bytes, float] | None] = asyncio.Queue(
             settings.hardware_qwen_queue_size
         )
         self._ws: Any = None
@@ -94,6 +96,73 @@ class HardwareQwenRealtimeSession:
         self._asr_parts: list[str] = []
         self._last_pcm_at: float | None = None
         self._last_mp3_at: float | None = None
+        self._marks: dict[str, float] = {"dialogue_start": self.result.started_at}
+
+    def _mark(self, name: str, at: float | None = None) -> float:
+        value = time.perf_counter() if at is None else at
+        self._marks[name] = value
+        return value
+
+    def _duration(self, start: str, end: str) -> int | None:
+        if start not in self._marks or end not in self._marks:
+            return None
+        return max(0, int((self._marks[end] - self._marks[start]) * 1000))
+
+    def _update_timings(self) -> None:
+        pairs = {
+            "connect_ms": ("connect_start", "connect_done"),
+            "session_config_ms": ("session_config_start", "session_config_done"),
+            "bridge_start_ms": ("bridge_start", "ready"),
+            "start_to_ready_ms": ("dialogue_start", "ready"),
+            "capture_ms": ("first_input", "capture_end"),
+            "end_to_commit_ms": ("capture_end", "commit_start"),
+            "commit_send_ms": ("commit_start", "commit_sent"),
+            "asr_ms": ("commit_start", "asr_done"),
+            "retrieval_ms": ("retrieval_start", "retrieval_done"),
+            "context_update_ms": ("context_update", "context_confirmed"),
+            "response_to_first_text_ms": ("response_requested", "first_text"),
+            "end_to_first_text_ms": ("capture_end", "first_text"),
+            "response_to_first_pcm_ms": ("response_requested", "first_pcm"),
+            "end_to_first_pcm_ms": ("capture_end", "first_pcm"),
+            "pcm_to_first_mp3_ms": ("first_pcm", "first_mp3_generated"),
+            "first_mp3_queue_ms": ("first_mp3_generated", "first_mp3_send_start"),
+            "first_mp3_send_ms": ("first_mp3_send_start", "first_mp3_sent"),
+            "end_to_first_audio_ms": ("capture_end", "first_mp3_sent"),
+            "response_to_first_audio_ms": ("response_requested", "first_mp3_sent"),
+            "response_ms": ("response_requested", "response_done"),
+            "mp3_drain_ms": ("response_done", "mp3_done"),
+            "start_to_audio_done_ms": ("dialogue_start", "mp3_done"),
+        }
+        for key, (start, end) in pairs.items():
+            duration = self._duration(start, end)
+            if duration is not None:
+                self.result.timings_ms[key] = duration
+
+    def _turn_instructions(self, references: str = "") -> str:
+        # 首次配置和 ASR/RAG 后都刷新，录音跨过午夜时仍使用回答时的日期。
+        current = local_now()
+        sections = [self.instructions]
+        if references:
+            sections.append(references)
+        sections.append(build_current_time_context(current))
+        logger.info(
+            "[HARDWARE-QWEN][%s][时间基准] 北京时间=%s",
+            self.trace_id,
+            current.astimezone(BEIJING_TIMEZONE).isoformat(timespec="seconds"),
+        )
+        return "\n\n".join(sections)
+
+    def _first_text(self, text: str) -> None:
+        if not text or "first_text" in self._marks:
+            return
+        self._mark("first_text")
+        self._update_timings()
+        logger.info(
+            "[HARDWARE-QWEN][%s][首段文字] 请求回答后=%sms 录音结束后=%sms（不是设备实际发声时间）",
+            self.trace_id,
+            self._duration("response_requested", "first_text"),
+            self._duration("capture_end", "first_text"),
+        )
 
     async def _send(self, event_type: str, **fields: Any) -> str:
         event_id = f"hardware_qwen_{uuid.uuid4().hex}"
@@ -151,6 +220,7 @@ class HardwareQwenRealtimeSession:
         self._loop = asyncio.get_running_loop()
         self._bridge_error = self._loop.create_future()
         try:
+            self._mark("connect_start")
             self._ws = await websockets.connect(
                 url,
                 additional_headers={
@@ -161,16 +231,23 @@ class HardwareQwenRealtimeSession:
                 close_timeout=3,
                 max_size=2**24,
             )
+            self._mark("connect_done")
+            logger.info(
+                "[HARDWARE-QWEN][%s][上游连接] 耗时=%sms",
+                self.trace_id,
+                self._duration("connect_start", "connect_done"),
+            )
             self._deadline = (
                 time.monotonic() + settings.hardware_qwen_connect_timeout_seconds
             )
             # 与同事一样通过 instructions 传入人设和上下文，不新增多条 system item。
+            self._mark("session_config_start")
             await self._send(
                 "session.update",
                 session={
                     "modalities": ["text", "audio"],
                     "voice": settings.hardware_qwen_realtime_voice,
-                    "instructions": self.instructions,
+                    "instructions": self._turn_instructions(),
                     "turn_detection": None,
                     "enable_search": settings.hardware_qwen_realtime_enable_search,
                     "input_audio_transcription": {
@@ -178,8 +255,24 @@ class HardwareQwenRealtimeSession:
                     },
                 },
             )
-            while (await self._recv()).get("type") != "session.updated":
-                pass
+            while True:
+                event = await self._recv()
+                if event.get("type") == "session.updated":
+                    applied = event.get("session") or {}
+                    logger.info(
+                        "[HARDWARE-QWEN][%s][联网配置] 请求enable_search=%s 上游确认=%s",
+                        self.trace_id,
+                        settings.hardware_qwen_realtime_enable_search,
+                        applied.get("enable_search", "未返回"),
+                    )
+                    break
+            self._mark("session_config_done")
+            logger.info(
+                "[HARDWARE-QWEN][%s][初始配置] 确认耗时=%sms",
+                self.trace_id,
+                self._duration("session_config_start", "session_config_done"),
+            )
+            self._mark("bridge_start")
             bridge_task = asyncio.create_task(
                 asyncio.to_thread(
                     PcmToCiMp3Bridge,
@@ -199,6 +292,13 @@ class HardwareQwenRealtimeSession:
                 # 构造器在线程中，取消 asyncio 等待不会取消已启动的 FFmpeg。
                 self._bridge = await bridge_task
                 raise
+            self._mark("ready")
+            logger.info(
+                "[HARDWARE-QWEN][%s][转码器启动] 耗时=%sms 从对话开始到就绪=%sms",
+                self.trace_id,
+                self._duration("bridge_start", "ready"),
+                self._duration("dialogue_start", "ready"),
+            )
             self._deadline = (
                 time.monotonic() + settings.hardware_qwen_capture_timeout_seconds
             )
@@ -228,6 +328,8 @@ class HardwareQwenRealtimeSession:
             self._commands.put_nowait(("append", pcm))
         except asyncio.QueueFull:
             return False
+        if "first_input" not in self._marks:
+            self._mark("first_input")
         self.result.input_audio_bytes += len(pcm)
         self.result.input_audio_chunks += 1
         return True
@@ -241,6 +343,15 @@ class HardwareQwenRealtimeSession:
             self._commands.put_nowait(("commit", None))
         except asyncio.QueueFull:
             return False
+        self._mark("capture_end")
+        logger.info(
+            "[HARDWARE-QWEN][%s][录音结束] 收音耗时=%sms 从对话开始=%sms 帧数=%d 字节=%d",
+            self.trace_id,
+            self._duration("first_input", "capture_end"),
+            self._duration("dialogue_start", "capture_end"),
+            self.result.input_audio_chunks,
+            self.result.input_audio_bytes,
+        )
         self._commit_enqueued = True
         return True
 
@@ -264,7 +375,9 @@ class HardwareQwenRealtimeSession:
         # FFmpeg reader 线程等待有界下行队列，避免慢设备造成无限积压。
         if self._closed or self._loop is None:
             return
-        future = asyncio.run_coroutine_threadsafe(self._mp3.put(chunk), self._loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self._mp3.put((chunk, time.perf_counter())), self._loop
+        )
         try:
             future.result(timeout=5)
         except BaseException:
@@ -273,17 +386,34 @@ class HardwareQwenRealtimeSession:
 
     async def _pump_mp3(self) -> None:
         while True:
-            chunk = await self._mp3.get()
-            if chunk is None:
+            item = await self._mp3.get()
+            if item is None:
                 return
+            chunk, generated_at = item
             if self._closed:
                 return
+            first = self.result.first_chunk_ms is None
+            if first:
+                self._mark("first_mp3_generated", generated_at)
+                self._mark("first_mp3_send_start")
             await asyncio.wait_for(self._send_audio(chunk), timeout=5)
             now = time.perf_counter()
             self.result.audio_bytes += len(chunk)
             self.result.audio_chunks += 1
             if self.result.first_chunk_ms is None:
+                self._mark("first_mp3_sent", now)
                 self.result.first_chunk_ms = int((now - self.result.started_at) * 1000)
+                self._update_timings()
+                logger.info(
+                    "[HARDWARE-QWEN][%s][首音频发送] 录音结束到首包=%sms 请求回答到首包=%sms PCM转MP3=%sms 排队=%sms 发送=%sms 从对话开始=%sms（服务器发出，不是设备实际发声）",
+                    self.trace_id,
+                    self.result.timings_ms.get("end_to_first_audio_ms"),
+                    self.result.timings_ms.get("response_to_first_audio_ms"),
+                    self.result.timings_ms.get("pcm_to_first_mp3_ms"),
+                    self.result.timings_ms.get("first_mp3_queue_ms"),
+                    self.result.timings_ms.get("first_mp3_send_ms"),
+                    self.result.first_chunk_ms,
+                )
             if self._last_mp3_at is not None:
                 self.result.mp3_output_max_gap_ms = max(
                     self.result.mp3_output_max_gap_ms,
@@ -306,6 +436,7 @@ class HardwareQwenRealtimeSession:
                         audio=base64.b64encode(data[:even_length]).decode("ascii"),
                     )
             elif name == "commit":
+                self._mark("commit_prepare_start")
                 if pending:
                     raise HardwareQwenError("PCM 字节数不是完整的 16bit 样本")
                 count = math.ceil(settings.hardware_qwen_realtime_tail_silence_ms / 20)
@@ -321,7 +452,16 @@ class HardwareQwenRealtimeSession:
                 self._deadline = (
                     time.monotonic() + settings.hardware_qwen_asr_timeout_seconds
                 )
+                self._mark("commit_start")
                 await self._send("input_audio_buffer.commit")
+                self._mark("commit_sent")
+                logger.info(
+                    "[HARDWARE-QWEN][%s][音频提交] 队列及尾静音发送=%sms commit发送=%sms 补静音=%dms",
+                    self.trace_id,
+                    self._duration("capture_end", "commit_start"),
+                    self._duration("commit_start", "commit_sent"),
+                    count * 20,
+                )
                 # 不立即 response.create：必须等转写和本地检索完成。
 
     async def _receive_events(self) -> None:
@@ -346,15 +486,26 @@ class HardwareQwenRealtimeSession:
                 ).strip()
                 if not self.result.asr_text:
                     raise HardwareQwenError("没有识别到有效语音，请重试")
+                self._mark("asr_done")
                 logger.info(
-                    "[HARDWARE-QWEN][%s] ASR 完成，开始本轮检索 内容=%s",
+                    "[HARDWARE-QWEN][%s][识别完成] commit后=%sms 录音结束后=%sms 内容=%s",
                     self.trace_id,
+                    self._duration("commit_start", "asr_done"),
+                    self._duration("capture_end", "asr_done"),
                     self.result.asr_text,
                 )
+                self._mark("retrieval_start")
+                self._phase = "本轮资料检索"
                 references = await self._retrieve_references(self.result.asr_text)
-                instructions = self.instructions + (
-                    "\n\n" + references if references else ""
+                self._mark("retrieval_done")
+                logger.info(
+                    "[HARDWARE-QWEN][%s][资料检索] 总耗时=%sms 参考字数=%d",
+                    self.trace_id,
+                    self._duration("retrieval_start", "retrieval_done"),
+                    len(references),
                 )
+                instructions = self._turn_instructions(references)
+                self._mark("context_update")
                 self._context_update_event_id = await self._send(
                     "session.update", session={"instructions": instructions}
                 )
@@ -367,15 +518,28 @@ class HardwareQwenRealtimeSession:
                 and self._context_update_event_id
                 and not self._response_requested
             ):
+                self._mark("context_confirmed")
                 self._response_requested = True
                 self._phase = "回答首段语音"
                 self._deadline = (
                     time.monotonic()
                     + settings.hardware_qwen_first_response_timeout_seconds
                 )
+                self._mark("response_requested")
                 await self._send("response.create")
                 logger.info(
-                    "[HARDWARE-QWEN][%s] 资料更新已确认，已请求回答", self.trace_id
+                    "[HARDWARE-QWEN][%s][请求回答] 资料更新确认=%sms 录音结束后=%sms enable_search=%s",
+                    self.trace_id,
+                    self._duration("context_update", "context_confirmed"),
+                    self._duration("capture_end", "response_requested"),
+                    settings.hardware_qwen_realtime_enable_search,
+                )
+            elif event_type == "response.created":
+                self._mark("response_created")
+                logger.info(
+                    "[HARDWARE-QWEN][%s][生成已开始] 请求确认=%sms",
+                    self.trace_id,
+                    self._duration("response_requested", "response_created"),
                 )
             elif event_type in {"response.audio.delta", "response.output_audio.delta"}:
                 if not self._response_requested:
@@ -391,8 +555,16 @@ class HardwareQwenRealtimeSession:
                     )
                 self._last_pcm_at = now
                 if self.result.first_provider_audio_ms is None:
+                    self._mark("first_pcm", now)
                     self.result.first_provider_audio_ms = int(
                         (now - self.result.started_at) * 1000
+                    )
+                    logger.info(
+                        "[HARDWARE-QWEN][%s][首段PCM] 请求回答后=%sms 录音结束后=%sms 字节=%d",
+                        self.trace_id,
+                        self._duration("response_requested", "first_pcm"),
+                        self._duration("capture_end", "first_pcm"),
+                        len(pcm),
                     )
                 self.result.output_pcm_bytes += len(pcm)
                 self.result.output_pcm_chunks += 1
@@ -409,21 +581,28 @@ class HardwareQwenRealtimeSession:
                 "response.audio_transcript.delta",
                 "response.output_audio_transcript.delta",
             }:
-                self._answer_parts.append(str(event.get("delta") or ""))
+                text = str(event.get("delta") or "")
+                self._first_text(text)
+                self._answer_parts.append(text)
             elif event_type in {
                 "response.audio_transcript.done",
                 "response.output_audio_transcript.done",
             }:
                 if not self._answer_parts:
-                    self._answer_parts.append(
-                        str(event.get("transcript") or event.get("text") or "")
-                    )
+                    text = str(event.get("transcript") or event.get("text") or "")
+                    self._first_text(text)
+                    self._answer_parts.append(text)
             elif event_type in {"response.text.delta", "response.output_text.delta"}:
-                self._text_parts.append(str(event.get("delta") or ""))
+                text = str(event.get("delta") or "")
+                self._first_text(text)
+                self._text_parts.append(text)
             elif event_type in {"response.text.done", "response.output_text.done"}:
                 if not self._text_parts:
-                    self._text_parts.append(str(event.get("text") or ""))
+                    text = str(event.get("text") or "")
+                    self._first_text(text)
+                    self._text_parts.append(text)
             elif event_type == "response.done":
+                self._mark("response_done")
                 response = event.get("response") or {}
                 if response.get("status") != "completed":
                     raise HardwareQwenError(
@@ -436,6 +615,7 @@ class HardwareQwenRealtimeSession:
                     self.result.answer_text = self._final_transcript(response)
                 if not self.result.answer_text or not self.result.output_pcm_bytes:
                     raise HardwareQwenError("千问没有返回完整的语音回答")
+                self._first_text(self.result.answer_text)
                 usage = response.get("usage") or {}
                 plugins = usage.get("plugins") or {}
                 search = plugins.get("search") or {}
@@ -443,6 +623,16 @@ class HardwareQwenRealtimeSession:
                     search.get("count") if isinstance(search, dict) else None
                 )
                 self.result.finish_reason = "response.done:completed"
+                logger.info(
+                    "[HARDWARE-QWEN][%s][上游回答结束] 生成耗时=%sms 回复字数=%d enable_search=%s 搜索次数=%s",
+                    self.trace_id,
+                    self._duration("response_requested", "response_done"),
+                    len(self.result.answer_text),
+                    settings.hardware_qwen_realtime_enable_search,
+                    self.result.search_count
+                    if self.result.search_count is not None
+                    else "未返回",
+                )
                 return
 
     @staticmethod
@@ -470,6 +660,7 @@ class HardwareQwenRealtimeSession:
             if receiver not in done:
                 raise HardwareQwenError("千问收发任务提前结束")
             # 保持下行 pump 活跃，先排空 FFmpeg，再排空 MP3 队列。
+            self._phase = "剩余MP3转码及下发"
             bridge = self._bridge
             if bridge is None:
                 raise HardwareQwenError("音频转换桥已关闭")
@@ -495,6 +686,9 @@ class HardwareQwenRealtimeSession:
             self._bridge = None
             await self._mp3.put(None)
             await pump
+            self._mark("mp3_done")
+            self._update_timings()
+            self._phase = "语音已发完"
             if not self.result.audio_bytes:
                 raise HardwareQwenError("没有生成设备可播放的 MP3")
             logger.info(
@@ -506,7 +700,21 @@ class HardwareQwenRealtimeSession:
                 self.result.mp3_output_max_gap_ms,
                 self.result.search_count,
             )
+            logger.info(
+                "[HARDWARE-QWEN][%s][语音阶段汇总] timings_ms=%s",
+                self.trace_id,
+                json.dumps(self.result.timings_ms, ensure_ascii=False),
+            )
             return self.result
+        except BaseException:
+            self._update_timings()
+            logger.info(
+                "[HARDWARE-QWEN][%s][中断阶段汇总] 当前阶段=%s timings_ms=%s",
+                self.trace_id,
+                self._phase,
+                json.dumps(self.result.timings_ms, ensure_ascii=False),
+            )
+            raise
         finally:
             for task in tasks:
                 if not task.done():

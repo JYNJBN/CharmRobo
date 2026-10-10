@@ -940,13 +940,19 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
         cancel_event: asyncio.Event,
     ) -> None:
         nonlocal turn_task, turn_cancel_event, realtime_session, collecting
+        worker_phase = "语音生成及下发"
+        phase_started_at = perf_counter()
         try:
             result = await adapter.wait()
             if cancel_event.is_set():
                 return
+            worker_phase = "会话保存"
+            phase_started_at = perf_counter()
             await persist_hardware_realtime_turn(
                 business_session, result.asr_text, result.answer_text,
             )
+            result.timings_ms["persistence_ms"] = int((perf_counter() - phase_started_at) * 1000)
+            logger.info("[HARDWARE-QWEN][%s][会话保存] 耗时=%dms", worker_req, result.timings_ms["persistence_ms"])
             asyncio.create_task(summarize_conversation_in_background(
                 conversation_id=business_session.conversation_id,
                 device_id=business_session.device_id, user_id=business_session.user_id,
@@ -955,12 +961,18 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             ))
             # 完成消息会触发设备立即发下一轮 start；先清理旧上游和状态，
             # 否则设备会在旧 worker 的 close 等待期间被误判为仍在对话。
+            worker_phase = "上游清理"
+            phase_started_at = perf_counter()
             await adapter.aclose()
+            result.timings_ms["upstream_close_ms"] = int((perf_counter() - phase_started_at) * 1000)
+            logger.info("[HARDWARE-QWEN][%s][上游清理] 耗时=%dms", worker_req, result.timings_ms["upstream_close_ms"])
             if turn_task is asyncio.current_task():
                 turn_task = None
                 turn_cancel_event = None
                 realtime_session = None
                 collecting = False
+            worker_phase = "完成消息发送"
+            phase_started_at = perf_counter()
             await send_json({
                 "type": "dialogue.done", "req": worker_req,
                 "client_req": worker_client_req, "route": "realtime", "provider": "qwen",
@@ -984,10 +996,11 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 "total_ms": int((perf_counter() - result.started_at) * 1000),
                 "action": "chat",
             })
+            logger.info("[HARDWARE-QWEN][%s][本轮汇总] 完成消息发送=%dms 总耗时=%dms timings_ms=%s", worker_req, int((perf_counter() - phase_started_at) * 1000), int((perf_counter() - result.started_at) * 1000), json.dumps(result.timings_ms, ensure_ascii=False))
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            logger.exception("[HARDWARE-QWEN][%s] 设备端到端失败", worker_req)
+            logger.exception("[HARDWARE-QWEN][%s] 设备端到端失败 当前阶段=%s 阶段耗时=%dms 总耗时=%dms", worker_req, worker_phase, int((perf_counter() - phase_started_at) * 1000), int((perf_counter() - adapter.result.started_at) * 1000))
             if not cancel_event.is_set():
                 await send_json({
                     "type": "dialogue.error", "req": worker_req,
@@ -1409,7 +1422,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 received_frame_count = 0
                 first_audio_frame_at = None
                 collecting = True
-                turn_started_at = perf_counter()
+                turn_started_at = start_received_at
                 if turn_route == "realtime":
                     # 捕获本轮上下文，不能让下一轮的 Agent/取消状态影响迟到回调。
                     business_session = session

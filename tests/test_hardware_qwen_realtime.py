@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -18,6 +19,7 @@ from app.models.conversation import Conversation
 from app.models.conversation_message import ConversationMessage
 from app.services import conversation_service
 from app.services import hardware_realtime_context as context_service
+from app.utils.tools import build_current_time_context
 
 
 class FakeUpstream:
@@ -214,6 +216,18 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
                 result = await asyncio.wait_for(session.wait(), 2)
                 self.assertEqual(result.answer_text, "早餐七点开始。")
                 self.assertEqual(result.search_count, 1)
+                for name in (
+                    "asr_ms",
+                    "retrieval_ms",
+                    "context_update_ms",
+                    "response_to_first_text_ms",
+                    "response_to_first_pcm_ms",
+                    "pcm_to_first_mp3_ms",
+                    "end_to_first_audio_ms",
+                    "mp3_drain_ms",
+                ):
+                    self.assertIn(name, result.timings_ms)
+                    self.assertGreaterEqual(result.timings_ms[name], 0)
                 self.assertEqual(result.endpoint_silence_bytes, 6400)
                 self.assertEqual(output, [b"mock-mp3"])
                 updates = [x for x in upstream.sent if x["type"] == "session.update"]
@@ -231,6 +245,69 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await session.aclose()
         self.assertTrue(upstream.closed)
+
+    async def test_date_is_refreshed_after_capture_crosses_beijing_midnight(self):
+        upstream = FakeUpstream()
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="历史对话：今天是五月。",
+            trace_id="date-test",
+            send_audio=AsyncMock(),
+            retrieve_references=AsyncMock(return_value="旧知识库日期：五月"),
+        )
+        with (
+            patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)),
+            patch.object(
+                qwen,
+                "local_now",
+                side_effect=[
+                    datetime(2026, 10, 9, 15, 59, 59, tzinfo=timezone.utc),
+                    datetime(2026, 10, 9, 16, 0, 1, tzinfo=timezone.utc),
+                ],
+            ),
+        ):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                await asyncio.wait_for(session.wait(), 2)
+                updates = [
+                    x["session"]["instructions"]
+                    for x in upstream.sent
+                    if x["type"] == "session.update"
+                ]
+                self.assertIn("今天是2026年10月9日", updates[0])
+                self.assertIn("今天是2026年10月10日，星期六", updates[1])
+                self.assertNotIn("今天是2026年10月9日", updates[1])
+                self.assertEqual(updates[1].count("本轮当前时间"), 1)
+                self.assertGreater(
+                    updates[1].index("本轮当前时间"), updates[1].index("旧知识库日期")
+                )
+            finally:
+                await session.aclose()
+
+    def test_latency_metrics_use_separate_capture_and_response_reference_points(self):
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="persona",
+            trace_id="metrics-test",
+            send_audio=AsyncMock(),
+            retrieve_references=AsyncMock(),
+            started_at=10,
+        )
+        session._marks.update(
+            {
+                "capture_end": 14,
+                "response_requested": 15,
+                "first_pcm": 15.5,
+                "first_mp3_generated": 15.75,
+                "first_mp3_send_start": 15.8,
+                "first_mp3_sent": 16,
+            }
+        )
+        session._update_timings()
+        self.assertEqual(session.result.timings_ms["end_to_first_audio_ms"], 2000)
+        self.assertEqual(session.result.timings_ms["response_to_first_audio_ms"], 1000)
+        self.assertEqual(session.result.timings_ms["pcm_to_first_mp3_ms"], 250)
+        self.assertNotIn("response_to_first_text_ms", session.result.timings_ms)
 
     async def test_failed_response_is_not_success(self):
         upstream = FakeUpstream(status="failed")
@@ -464,6 +541,16 @@ class ReferenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(conversation.message_count, 6)
         db.commit.assert_awaited_once()
+
+
+class BeijingClockTests(unittest.TestCase):
+    def test_utc_date_is_converted_to_beijing_date(self):
+        text = build_current_time_context(
+            datetime(2026, 10, 9, 16, 30, tzinfo=timezone.utc)
+        )
+        self.assertIn("2026-10-10 00:30:00", text)
+        self.assertIn("今天是2026年10月10日，星期六", text)
+        self.assertIn("UTC+08:00", text)
 
 
 class ConversationOwnershipTests(unittest.IsolatedAsyncioTestCase):
