@@ -1,7 +1,7 @@
 import logging
 from time import perf_counter
 
-from sqlalchemy import select, text
+from sqlalchemy import case, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conversation import Conversation
@@ -47,8 +47,9 @@ async def get_or_create_conversation(
 ) -> Conversation:
     """返回当前 Agent 的本地连续会话。
 
-    conversation 按 agent_id 隔离：同一用户切换到另一个 Agent 时会进入
-    另一条历史链，这是为了防止不同 Agent 的人设和私有上下文互相污染。
+    conversation 按用户、设备和 agent_id 隔离。同归属的历史空字段会补齐，
+    已属于其他用户或设备的记录不复用，避免旧绑定记录进入当前会话。
+    同一用户切换到另一个 Agent 时仍进入另一条历史链。
     端到端重连时，路由通过这个 conversation_id 重新取最近消息。
     """
 
@@ -60,13 +61,28 @@ async def get_or_create_conversation(
         ),
         {"agent_id": agent_id}
     )
-    # 先查有没有会话 有就直接返回，没有就创建会话返回
+    # 历史会话的 user_id/device_id 允许为空，但明确的不同归属不能复用。
+    # 优先完整匹配的会话，再兼容缺失字段，最后按 id 保证选择顺序稳定。
     conversation = await db.scalar(
-        select(Conversation).where(
-            Conversation.agent_id == agent_id
+        select(Conversation)
+        .where(
+            Conversation.agent_id == agent_id,
+            or_(Conversation.user_id == user_id, Conversation.user_id.is_(None)),
+            or_(Conversation.device_id == device_id, Conversation.device_id.is_(None)),
         )
+        .order_by(
+            case((Conversation.user_id == user_id, 1), else_=0).desc(),
+            case((Conversation.device_id == device_id, 1), else_=0).desc(),
+            Conversation.id.desc(),
+        )
+        .limit(1)
+        .with_for_update()
     )
     if conversation is not None:
+        if conversation.user_id is None or conversation.device_id is None:
+            conversation.user_id = user_id
+            conversation.device_id = device_id
+            await db.commit()
         return conversation
     conversation = Conversation(
         user_id=user_id,
