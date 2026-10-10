@@ -2,7 +2,7 @@
 
 音频队列、200ms 尾静音、Tina、24k PCM→16k MP3 均沿用设备方案。
 区别是 commit 后等待输入转写、检索业务资料并更新 instructions，再创建回答。
-一个实例只处理一轮；设备长连接上的下一轮会重新读取当前智能体。
+一个实例只处理一轮；下一轮可接管连接，清理上游消息后重新读取当前智能体。
 """
 
 from __future__ import annotations
@@ -104,6 +104,7 @@ class HardwareQwenResult:
     search_count: int | None = None
     timings_ms: dict[str, int] = field(default_factory=dict)
     needs_repeat: bool = False
+    upstream_reused: bool = False
 
 
 class HardwareQwenRealtimeSession:
@@ -115,9 +116,19 @@ class HardwareQwenRealtimeSession:
         send_audio: Callable[[bytes], Awaitable[None]],
         retrieve_references: Callable[[str], Awaitable[str]],
         started_at: float | None = None,
+        reuse_key: tuple[object, ...] | None = None,
     ) -> None:
         self.instructions = instructions
         self.trace_id = trace_id
+        self._reuse_key = reuse_key
+        self._connection_config = (
+            settings.hardware_qwen_realtime_ws_url,
+            settings.hardware_qwen_realtime_model,
+            settings.hardware_qwen_realtime_voice,
+        )
+        self._item_ids: set[str] = set()
+        self._input_item_seen = False
+        self._output_item_seen = False
         self._voice = settings.hardware_qwen_realtime_voice
         self._send_audio = send_audio
         self._retrieve_references = retrieve_references
@@ -290,14 +301,34 @@ class HardwareQwenRealtimeSession:
             self._upstream_session_id = str(
                 (event.get("session") or {}).get("id") or "未返回"
             )
+        # 记录音频用户消息及助手输出，下一轮从上游删除，避免与数据库历史重复。
+        item_id = event.get("item_id")
+        item = event.get("item") or {}
+        if isinstance(item, dict) and item.get("id"):
+            self._item_ids.add(str(item["id"]))
+            if item.get("role") == "assistant":
+                self._output_item_seen = True
+            elif item.get("role") == "user":
+                self._input_item_seen = True
+        if item_id and (
+            self._last_event_type == "input_audio_buffer.committed"
+            or self._last_event_type.startswith("conversation.item.input_audio_transcription.")
+        ):
+            self._item_ids.add(str(item_id))
+            self._input_item_seen = True
+        if self._last_event_type == "response.done":
+            for output in (event.get("response") or {}).get("output") or []:
+                if isinstance(output, dict) and output.get("id"):
+                    self._item_ids.add(str(output["id"]))
+                    self._output_item_seen = True
         if event.get("type") == "error":
             raise HardwareQwenError(
                 f"千问上游错误：{json.dumps(event.get('error'), ensure_ascii=False)}"
             )
         return event
 
-    async def start(self) -> None:
-        """先等待 session.updated，再准备桥和收发任务，最后才允许设备上传。"""
+    async def start(self, previous: HardwareQwenRealtimeSession | None = None) -> None:
+        """接管或建立上游，等待清理及配置确认，再允许设备上传本轮音频。"""
         if self._closed or self._ws is not None:
             raise HardwareQwenError("会话已启动或已关闭")
         key = settings.hardware_qwen_realtime_api_key
@@ -322,105 +353,171 @@ class HardwareQwenRealtimeSession:
         self._loop = asyncio.get_running_loop()
         self._bridge_error = self._loop.create_future()
         try:
-            self._mark("connect_start")
-            self._ws = await websockets.connect(
-                url,
-                additional_headers={
-                    "Authorization": f"Bearer {key.get_secret_value()}"
-                },
-                ping_interval=None,
-                open_timeout=settings.hardware_qwen_connect_timeout_seconds,
-                close_timeout=3,
-                max_size=2**24,
-            )
-            self._mark("connect_done")
-            logger.info(
-                "[HARDWARE-QWEN][%s][上游连接] 耗时=%sms",
-                self.trace_id,
-                self._duration("connect_start", "connect_done"),
-            )
-            self._deadline = (
-                time.monotonic() + settings.hardware_qwen_connect_timeout_seconds
-            )
-            # 与同事一样通过 instructions 传入人设和上下文，不新增多条 system item。
-            self._mark("session_config_start")
-            session_config = build_hardware_qwen_session_config(
-                model=settings.hardware_qwen_realtime_model,
-                voice=settings.hardware_qwen_realtime_voice,
-                instructions=self._turn_instructions(),
-            )
-            self._voice = str(session_config["voice"])
-            if self._voice != settings.hardware_qwen_realtime_voice:
-                logger.warning(
-                    "[HARDWARE-QWEN][%s][音色适配] model=%s 不使用 Omni 音色=%s，本轮使用=%s；可通过 HARDWARE_QWEN_REALTIME_VOICE 指定匹配音色",
-                    self.trace_id,
-                    settings.hardware_qwen_realtime_model,
-                    settings.hardware_qwen_realtime_voice,
-                    self._voice,
+            pending_deletes: set[str] = set()
+            if previous is not None:
+                can_reuse = (
+                    not previous._closed
+                    and previous._ws is not None
+                    and previous._task is not None
+                    and previous._task.done()
+                    and not previous._task.cancelled()
+                    and previous._task.exception() is None
+                    and previous._bridge is None
+                    and self._reuse_key is not None
+                    and self._reuse_key == previous._reuse_key
+                    and self._connection_config == previous._connection_config
+                    and previous._input_item_seen
+                    and previous._output_item_seen
                 )
-            await self._send(
-                "session.update",
-                session=session_config,
-            )
-            while True:
-                event = await self._recv()
-                if event.get("type") == "session.updated":
-                    applied = event.get("session") or {}
+                if can_reuse:
+                    # 接管连接；旧实例及其音频队列不再拥有上游资源。
+                    self._ws, previous._ws = previous._ws, None
+                    self._upstream_session_id = previous._upstream_session_id
+                    pending_deletes = set(previous._item_ids)
+                else:
                     logger.info(
-                        "[HARDWARE-QWEN][%s][联网配置] 请求enable_search=%s 上游确认=%s",
+                        "[HARDWARE-QWEN][%s][连接复用] 旧连接不可复用，重新建立连接（配置或身份变化、上一轮异常、消息ID不完整）",
                         self.trace_id,
-                        settings.hardware_qwen_realtime_enable_search,
-                        applied.get("enable_search", "未返回"),
                     )
-                    break
-            self._mark("session_config_done")
-            logger.info(
-                "[HARDWARE-QWEN][%s][初始配置] 确认耗时=%sms",
-                self.trace_id,
-                self._duration("session_config_start", "session_config_done"),
-            )
-            self._mark("bridge_start")
-            bridge_task = asyncio.create_task(
-                asyncio.to_thread(
-                    PcmToCiMp3Bridge,
-                    input_rate=24000,
-                    bitrate=settings.hardware_qwen_mp3_bitrate,
-                    queue_size=settings.hardware_qwen_queue_size,
-                    put_timeout_sec=0.2,
-                    close_timeout_sec=60,
-                    on_mp3=self._on_mp3,
-                    on_error=self._on_bridge_error,
-                    on_trace=self._trace,
-                )
-            )
-            try:
-                self._bridge = await asyncio.shield(bridge_task)
-            except asyncio.CancelledError:
-                # 构造器在线程中，取消 asyncio 等待不会取消已启动的 FFmpeg。
-                self._bridge = await bridge_task
-                raise
-            self._mark("ready")
-            logger.info(
-                "[HARDWARE-QWEN][%s][转码器启动] 耗时=%sms 从对话开始到就绪=%sms",
-                self.trace_id,
-                self._duration("bridge_start", "ready"),
-                self._duration("dialogue_start", "ready"),
-            )
-            self._deadline = (
-                time.monotonic() + settings.hardware_qwen_capture_timeout_seconds
-            )
-            self._phase = "设备录音结束"
-            self._task = asyncio.create_task(self._run())
-            logger.info(
-                "[HARDWARE-QWEN][%s] 已就绪 model=%s voice=%s enable_search=%s",
-                self.trace_id,
-                settings.hardware_qwen_realtime_model,
-                self._voice,
-                settings.hardware_qwen_realtime_enable_search,
-            )
+                await previous.aclose()
+            if self._ws is not None:
+                try:
+                    await self._configure_upstream(pending_deletes)
+                    self.result.upstream_reused = True
+                    self.result.timings_ms["connect_ms"] = 0
+                    logger.info("[HARDWARE-QWEN][%s][连接复用] 已清理上一轮消息数=%d", self.trace_id, len(pending_deletes))
+                except Exception:
+                    # 尚未接收本轮音频，重连不会重复生成或下发语音。
+                    logger.warning("[HARDWARE-QWEN][%s][连接复用] 连接失效或清理失败，重新连接", self.trace_id, exc_info=True)
+                    ws, self._ws = self._ws, None
+                    try:
+                        await ws.close()
+                    except Exception:
+                        logger.warning("[HARDWARE-QWEN][%s] 旧连接关闭失败", self.trace_id)
+                    self._item_ids.clear()
+                    self._input_item_seen = self._output_item_seen = False
+            if self._ws is None:
+                await self._connect_and_configure(url, key.get_secret_value())
+            await self._start_bridge()
         except BaseException:
             await self.aclose()
             raise
+
+    async def _connect_and_configure(self, url: str, key: str) -> None:
+        self._mark("connect_start")
+        self._ws = await websockets.connect(
+            url,
+            additional_headers={
+                "Authorization": f"Bearer {key}"
+            },
+            ping_interval=None,
+            open_timeout=settings.hardware_qwen_connect_timeout_seconds,
+            close_timeout=3,
+            max_size=2**24,
+        )
+        self._mark("connect_done")
+        logger.info(
+            "[HARDWARE-QWEN][%s][上游连接] 耗时=%sms",
+            self.trace_id,
+            self._duration("connect_start", "connect_done"),
+        )
+        await self._configure_upstream()
+
+    async def _configure_upstream(self, pending_deletes: set[str] | None = None) -> None:
+        pending_deletes = set(pending_deletes or ())
+        needs_clear = bool(pending_deletes)
+        self._deadline = (
+            time.monotonic() + settings.hardware_qwen_connect_timeout_seconds
+        )
+        self._phase = "清理及配置会话"
+        self._mark("session_config_start")
+        # 清理与配置连续发出，一次等待所有确认，不逐条增加网络往返。
+        if needs_clear:
+            await self._send("input_audio_buffer.clear")
+            for item_id in sorted(pending_deletes):
+                await self._send("conversation.item.delete", item_id=item_id)
+        # 与同事一样通过 instructions 传入人设和上下文，不新增多条 system item。
+        session_config = build_hardware_qwen_session_config(
+            model=settings.hardware_qwen_realtime_model,
+            voice=settings.hardware_qwen_realtime_voice,
+            instructions=self._turn_instructions(),
+        )
+        self._voice = str(session_config["voice"])
+        if self._voice != settings.hardware_qwen_realtime_voice:
+            logger.warning(
+                "[HARDWARE-QWEN][%s][音色适配] model=%s 不使用 Omni 音色=%s，本轮使用=%s；可通过 HARDWARE_QWEN_REALTIME_VOICE 指定匹配音色",
+                self.trace_id,
+                settings.hardware_qwen_realtime_model,
+                settings.hardware_qwen_realtime_voice,
+                self._voice,
+            )
+        await self._send(
+            "session.update",
+            session=session_config,
+        )
+        configured = False
+        while not configured or needs_clear or pending_deletes:
+            event = await self._recv()
+            if event.get("type") == "input_audio_buffer.cleared":
+                needs_clear = False
+            elif event.get("type") == "conversation.item.deleted":
+                pending_deletes.discard(str(event.get("item_id")))
+            if event.get("type") == "session.updated":
+                applied = event.get("session") or {}
+                logger.info(
+                    "[HARDWARE-QWEN][%s][联网配置] 请求enable_search=%s 上游确认=%s",
+                    self.trace_id,
+                    settings.hardware_qwen_realtime_enable_search,
+                    applied.get("enable_search", "未返回"),
+                )
+                configured = True
+        self._mark("session_config_done")
+        logger.info(
+            "[HARDWARE-QWEN][%s][初始配置] 确认耗时=%sms",
+            self.trace_id,
+            self._duration("session_config_start", "session_config_done"),
+        )
+
+    async def _start_bridge(self) -> None:
+        self._mark("bridge_start")
+        bridge_task = asyncio.create_task(
+            asyncio.to_thread(
+                PcmToCiMp3Bridge,
+                input_rate=24000,
+                bitrate=settings.hardware_qwen_mp3_bitrate,
+                queue_size=settings.hardware_qwen_queue_size,
+                put_timeout_sec=0.2,
+                close_timeout_sec=60,
+                on_mp3=self._on_mp3,
+                on_error=self._on_bridge_error,
+                on_trace=self._trace,
+            )
+        )
+        try:
+            self._bridge = await asyncio.shield(bridge_task)
+        except asyncio.CancelledError:
+            # 构造器在线程中，取消 asyncio 等待不会取消已启动的 FFmpeg。
+            self._bridge = await bridge_task
+            raise
+        self._mark("ready")
+        logger.info(
+            "[HARDWARE-QWEN][%s][转码器启动] 耗时=%sms 从对话开始到就绪=%sms",
+            self.trace_id,
+            self._duration("bridge_start", "ready"),
+            self._duration("dialogue_start", "ready"),
+        )
+        self._deadline = (
+            time.monotonic() + settings.hardware_qwen_capture_timeout_seconds
+        )
+        self._phase = "设备录音结束"
+        self._task = asyncio.create_task(self._run())
+        logger.info(
+            "[HARDWARE-QWEN][%s] 已就绪 model=%s voice=%s enable_search=%s",
+            self.trace_id,
+            settings.hardware_qwen_realtime_model,
+            self._voice,
+            settings.hardware_qwen_realtime_enable_search,
+        )
 
     def append_audio(self, pcm: bytes) -> bool:
         if (

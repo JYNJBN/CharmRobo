@@ -33,6 +33,7 @@ class FakeUpstream:
         self.transcribe = transcribe
         self.transcript = transcript
         self.reply = "早餐七点开始。"
+        self.turn_number = 0
         self.queue.put_nowait({"type": "session.created"})
 
     async def send(self, raw):
@@ -49,10 +50,12 @@ class FakeUpstream:
                 self.reply = qwen.ASR_EMPTY_REPEAT_PROMPT
             self.queue.put_nowait({"type": "session.updated"})
         elif kind == "input_audio_buffer.commit" and self.transcribe:
+            self.turn_number += 1
             self.queue.put_nowait(
                 {
                     "type": "conversation.item.input_audio_transcription.completed",
                     "transcript": self.transcript,
+                    "item_id": f"user-{self.turn_number}",
                 }
             )
         elif kind == "response.create":
@@ -67,11 +70,16 @@ class FakeUpstream:
                     "type": "response.done",
                     "response": {
                         "status": self.status,
+                        "output": [{"id": f"assistant-{self.turn_number}", "role": "assistant"}],
                         "usage": {"plugins": {"search": {"count": 1}}},
                     },
                 },
             ):
                 self.queue.put_nowait(reply)
+        elif kind == "input_audio_buffer.clear":
+            self.queue.put_nowait({"type": "input_audio_buffer.cleared"})
+        elif kind == "conversation.item.delete":
+            self.queue.put_nowait({"type": "conversation.item.deleted", "item_id": event["item_id"]})
 
     async def recv(self):
         return json.dumps(await self.queue.get(), ensure_ascii=False)
@@ -616,7 +624,7 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
                 await session.aclose()
 
     async def run_gateway(
-        self, device, upstream_status="completed", upstream_factory=None
+        self, device, upstream_status="completed", upstream_factory=None, sessions=None
     ):
         connections = []
 
@@ -629,7 +637,7 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             connections.append(upstream)
             return upstream
 
-        load = AsyncMock(side_effect=[business_session(9), business_session(10)])
+        load = AsyncMock(side_effect=sessions or [business_session(9), business_session(10)])
         persist = AsyncMock()
         refs = AsyncMock(return_value="知识库资料")
         with (
@@ -753,6 +761,102 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(expected_fields.issubset(message))
                 self.assertEqual(message["output_pcm_chunks"], 1)
         self.assertTrue(all(x.closed for x in connections))
+
+    async def test_same_agent_three_turns_reuse_and_delete_only_previous_items(self):
+        device = FakeDevice(turns=3)
+        sessions = [business_session(9) for _ in range(3)]
+        sessions[1].history_messages = [{"role": "assistant", "content": "第一轮历史"}]
+        sessions[2].history_messages = [{"role": "assistant", "content": "第二轮历史"}]
+        connections, load, persist, refs = await self.run_gateway(device, sessions=sessions)
+        self.assertEqual(len(connections), 1)
+        self.assertEqual((load.await_count, persist.await_count, refs.await_count), (3, 3, 3))
+        self.assertEqual(device.audio, [b"mock-mp3"] * 3)
+        done = [x for x in device.messages if x["type"] == "dialogue.done"]
+        self.assertEqual([x["upstream_reused"] for x in done], [False, True, True])
+        self.assertEqual([x["output_pcm_chunks"] for x in done], [1, 1, 1])
+        sent = connections[0].sent
+        deleted = [x["item_id"] for x in sent if x["type"] == "conversation.item.delete"]
+        self.assertEqual(deleted, ["assistant-1", "user-1", "assistant-2", "user-2"])
+        configs = [x["session"]["instructions"] for x in sent if x["type"] == "session.update" and "modalities" in x["session"]]
+        self.assertIn("第一轮历史", configs[1])
+        self.assertIn("第二轮历史", configs[2])
+        self.assertTrue(connections[0].closed)  # 设备断线才关闭。
+
+    async def test_reuse_restores_search_after_empty_transcription(self):
+        class RepeatThenNormal(FakeUpstream):
+            async def send(self, raw):
+                data = json.loads(raw)
+                if data["type"] == "input_audio_buffer.commit":
+                    self.transcript = "" if self.turn_number == 0 else "早餐几点？"
+                    self.reply = "早餐七点开始。"
+                await super().send(raw)
+
+        with patch.object(qwen.settings, "hardware_qwen_realtime_enable_search", True):
+            device = FakeDevice(turns=2)
+            connections, _, persist, refs = await self.run_gateway(
+                device, upstream_factory=RepeatThenNormal,
+                sessions=[business_session(9), business_session(9)],
+            )
+        self.assertEqual(len(connections), 1)
+        self.assertEqual(device.completed, 2)
+        persist.assert_awaited_once()
+        refs.assert_awaited_once()
+        updates = [x["session"] for x in connections[0].sent if x["type"] == "session.update"]
+        self.assertFalse(updates[1]["enable_search"])
+        self.assertTrue(updates[2]["enable_search"])
+
+    async def test_failed_reuse_reconnects_before_new_audio(self):
+        class DisconnectedBetweenTurns(FakeUpstream):
+            async def send(self, raw):
+                if json.loads(raw)["type"] == "input_audio_buffer.clear":
+                    raise ConnectionError("upstream idle connection closed")
+                await super().send(raw)
+
+        device = FakeDevice(turns=2)
+        with self.assertLogs(qwen.logger, level="WARNING"):
+            connections, _, persist, _ = await self.run_gateway(
+                device, upstream_factory=DisconnectedBetweenTurns,
+                sessions=[business_session(9), business_session(9)],
+            )
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(device.completed, 2)
+        self.assertEqual(persist.await_count, 2)
+        self.assertTrue(all(x.closed for x in connections))
+        self.assertEqual(sum(x["type"] == "response.create" for c in connections for x in c.sent), 2)
+
+    async def test_unknown_upstream_items_fall_back_to_new_connection(self):
+        class MissingItemIds(FakeUpstream):
+            async def recv(self):
+                event = json.loads(await super().recv())
+                event.pop("item_id", None)
+                if event["type"] == "response.done":
+                    event["response"].pop("output", None)
+                return json.dumps(event)
+
+        device = FakeDevice(turns=2)
+        connections, _, _, _ = await self.run_gateway(
+            device, upstream_factory=MissingItemIds,
+            sessions=[business_session(9), business_session(9)],
+        )
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(device.completed, 2)
+        self.assertTrue(all(x.closed for x in connections))
+
+    async def test_cancel_second_turn_closes_reused_connection(self):
+        class CancelSecondTurn(FakeDevice):
+            async def send_json(self, message):
+                if message["type"] == "dialogue.done":
+                    self.cancel = True
+                await super().send_json(message)
+
+        connections, _, persist, _ = await self.run_gateway(
+            CancelSecondTurn(turns=2),
+            sessions=[business_session(9), business_session(9)],
+        )
+        self.assertEqual(len(connections), 1)
+        persist.assert_awaited_once()
+        self.assertTrue(connections[0].closed)
+        self.assertEqual(sum(x["type"] == "response.create" for x in connections[0].sent), 1)
 
     async def test_cancel_during_capture_cleans_up_even_before_worker_started(self):
         connections, _, persist, _ = await self.run_gateway(FakeDevice(cancel=True))
