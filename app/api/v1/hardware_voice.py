@@ -8,20 +8,21 @@
 一轮对话的上行时序（ESP32 -> 服务端）：
 
 1. 文本帧 ``dialogue.start``，声明设备 SN、音频格式、采样率和字节数；
-2. 一个或多个二进制帧，内容是裸 PCM 或 CI 私有格式的 Speex；
-3. 文本帧 ``dialogue.end``，表示本轮录音上传完毕。
+2. 一个或多个二进制帧：端到端使用裸 PCM，级联也支持 CI 私有格式 Speex；
+3. 文本帧 ``dialogue.end`` 或 ``dialogue.commit``，表示本轮录音上传完毕。
 
 一轮对话的下行时序（服务端 -> ESP32）：
 
 1. 收到并接受 ``dialogue.start`` 后返回 ``dialogue.ready``；
-2. ASR、LLM、TTS 开始工作，百度 TTS 每返回一个 MP3 分片就立即发送一个
-   WebSocket 二进制帧；
+2. 端到端转发千问语音并持续转码为 MP3；级联调用百度 ASR/TTS；
+   每个 MP3 分片立即作为 WebSocket 二进制帧下发；
 3. 全部音频发完后返回 ``dialogue.done``；任何阶段失败则返回
    ``dialogue.error``。
 
 WebSocket 是可复用长连接：一次连接可以依次完成多轮 start/end 对话。
-当前 ASR 不是流式识别——服务器必须先收完整轮音频；LLM 和 TTS 是流式的，
-首个稳定短句生成后即可开始下发 MP3。
+默认线路由 HARDWARE_VOICE_ROUTE 控制，也可通过 start.route 或 URL route 选择。
+端到端边采集边转发，commit 后等待转写、检索记忆和知识库，再显式请求回答。
+原级联仍先收完整轮音频，LLM 和 TTS 流式处理。
 
 FastAPI/ASGI 已负责 WebSocket HTTP Upgrade、掩码、Ping/Pong 和底层帧解析，
 本文件只处理应用层 JSON 指令、音频二进制和业务状态机。
@@ -46,11 +47,16 @@ from starlette.websockets import WebSocketDisconnect
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.errors import BizError
-from app.integrations.baidu_speech import BaiduSpeechError, baidu_speech_client
+from app.integrations.baidu_speech import (
+    BaiduSpeechError,
+    BaiduTtsSession,
+    baidu_speech_client,
+)
 from app.integrations.hardware_audio import (
     HardwareAudioError,
     decode_ci_speex_to_pcm_async,
 )
+from app.integrations.hardware_qwen_realtime import HardwareQwenRealtimeSession
 from app.schemas.Model import ModelRegistryObject
 from app.services.agent_service import ensure_default_agent_on_device
 from app.services.conversation import run_turn
@@ -64,6 +70,11 @@ from app.services.conversation_service import (
 )
 from app.services.device_service import get_active_owner_binding, get_device_by_sn
 from app.services.hardware_actions import hardware_action_service
+from app.services.hardware_realtime_context import (
+    build_hardware_realtime_instructions,
+    persist_hardware_realtime_turn,
+    retrieve_hardware_realtime_references,
+)
 from app.services.hardware_tools import (
     build_hardware_tools,
     execute_hardware_tool,
@@ -89,6 +100,11 @@ MAX_SEGMENT_CHARS = 32
 # 16 kHz × 16 bit（2 字节）× 单声道 × 60 秒 = 1,920,000 字节。
 # 此限制检查的是 Speex 解码后的 PCM 大小，而不是压缩后的上传大小。
 MAX_ASR_PCM_BYTES = 60 * 16000 * 2
+
+# TTS 会话预热的等待上限。握手在正常情况下 0.3~0.6 秒完成，并且是和
+# ASR、记忆检索、LLM 首字并行跑的；超过这个时间说明百度侧或网络异常，
+# 本轮直接退回「一句一条连接」的旧路径，而不是让用户继续干等。
+TTS_PREWARM_TIMEOUT_SECONDS = 5.0
 
 # 将发送函数声明为类型别名，使流水线只关心“发送 JSON/字节”，不直接依赖
 # FastAPI WebSocket 对象，也让内部 TTS worker 可以复用同一个发送出口。
@@ -369,6 +385,41 @@ async def _save_message(
         )
 
 
+async def _open_tts_stream_safely(
+        request_id: str,
+        per: str,
+) -> BaiduTtsSession | None:
+    """预热一条可复用的 TTS 会话；失败返回 ``None`` 让调用方降级。
+
+    这个函数的定位是「绝不因为 TTS 建连问题让整轮对话失败」：握手失败、超时
+    都降级处理，由 ``tts_worker`` 退回「一句一条连接」的旧路径把本轮播报做完。
+    取消异常不在这里捕获，保持任务取消语义。
+    """
+
+    started_at = perf_counter()
+    try:
+        session = await asyncio.wait_for(
+            baidu_speech_client.open_tts_stream(per=per),
+            timeout=TTS_PREWARM_TIMEOUT_SECONDS,
+        )
+    except (BaiduSpeechError, asyncio.TimeoutError, OSError) as exc:
+        logger.warning(
+            "[HARDWARE-VOICE][%s][百度TTS] 会话预热失败，本轮退回逐句建连 "
+            "耗时=%.3f秒 error=%s",
+            request_id,
+            perf_counter() - started_at,
+            exc,
+        )
+        return None
+    logger.info(
+        "[HARDWARE-VOICE][%s][百度TTS] 会话已预热 per=%s 耗时=%.3f秒",
+        request_id,
+        per,
+        perf_counter() - started_at,
+    )
+    return session
+
+
 async def _run_hardware_turn(
         *,
         session: HardwareSession,
@@ -596,38 +647,88 @@ async def _run_hardware_turn(
     # 队列中是完整短句；None 是结束哨兵，表示 LLM 不会再产生新句子。
     tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-    async def tts_worker() -> None:
-        """按顺序消费短句，将百度返回的 MP3 分片立即转发给 ESP32。"""
+    async def drain_queue_per_sentence() -> None:
+        """降级路径：每个短句单独建一条 WebSocket 合成。
 
-        nonlocal audio_bytes, audio_chunks, first_chunk_ms
+        TTS 会话预热失败时使用，行为与改造前完全一致，保证百度短暂抖动时
+        本轮仍然能出声，代价只是首句要多等一次连接建立。
+        """
+
         while True:
             # 没有句子时挂起等待，不占用 CPU；LLM 切出句子后 put 会唤醒这里。
             sentence = await tts_queue.get()
             try:
                 if sentence is None:
                     return
-                # 每个 chunk 都是 MP3 字节流的一部分，不做 base64、不缓存完整文件。
-                sentence_started_at = perf_counter()
-                logger.info(
-                    "[HARDWARE-VOICE][%s][百度TTS] 句子开始 文本字数=%d",
-                    request_id,
-                    len(sentence),
-                )
-                async for chunk in baidu_speech_client.stream_synthesize_mp3(
-                        sentence,
-                        per=baidu_per,
-                ):
-                    await send_audio_chunk(chunk)
-                logger.info(
-                    "[HARDWARE-VOICE][%s][百度TTS] 句子完成 文本字数=%d "
-                    "耗时=%.3f秒",
-                    request_id,
-                    len(sentence),
-                    perf_counter() - sentence_started_at,
-                )
+                await stream_tts_text(sentence)
             finally:
                 # Queue 的每个 get 都必须对应 task_done，包括 None 和失败情况。
                 tts_queue.task_done()
+
+    async def tts_worker() -> None:
+        """消费短句并下发音频，整轮 TTS 只握手一次。
+
+        会话预热与 ASR、记忆检索、LLM 首字并行进行，所以第一句到达时连接
+        通常已经就绪：首个音频分片不再等待 TLS 握手和
+        ``system.start`` → ``system.started`` 往返，这正是压低首字延迟的
+        关键。文本追加与音频接收各自独立推进，LLM 边生成、TTS 边合成、
+        WebSocket 边下发三件事真正重叠。
+        """
+
+        stream = await _open_tts_stream_safely(request_id, baidu_per)
+        if stream is None:
+            await drain_queue_per_sentence()
+            return
+
+        async def feed_sentences() -> None:
+            """把分句器切好的短句按序追加到同一个 TTS 会话。"""
+
+            sentence_count = 0
+            while True:
+                sentence = await tts_queue.get()
+                try:
+                    if sentence is None:
+                        break
+                    sentence_count += 1
+                    logger.info(
+                        "[HARDWARE-VOICE][%s][百度TTS] 句子已追加 序号=%d "
+                        "文本字数=%d",
+                        request_id,
+                        sentence_count,
+                        len(sentence),
+                    )
+                    await stream.send_text(sentence)
+                finally:
+                    # Queue 的每个 get 都必须对应 task_done，包括 None。
+                    tts_queue.task_done()
+            # LLM 已无新文本：通知服务端把缓存内容立刻合成完，否则尾部会丢。
+            await stream.finish()
+
+        async def pump_audio() -> None:
+            """并发接收音频分片，每个分片立即转发给 ESP32。
+
+            分片是 MP3 字节流的一部分，不做 base64、不缓存完整文件。
+            """
+
+            async for chunk in stream.iter_audio():
+                await send_audio_chunk(chunk)
+
+        feed_task = asyncio.create_task(feed_sentences())
+        pump_task = asyncio.create_task(pump_audio())
+        try:
+            # 两个方向必须同时推进：只发不收会积压，只收不发则永远等不到
+            # system.finished。任一方向抛错都会立刻结束本轮并上报。
+            await asyncio.gather(feed_task, pump_task)
+        except BaseException:
+            # 一个方向失败后必须停掉另一个，否则会继续向已失败的会话写文本，
+            # 或永远挂在 recv 上泄漏任务。
+            feed_task.cancel()
+            pump_task.cancel()
+            await asyncio.gather(feed_task, pump_task, return_exceptions=True)
+            raise
+        finally:
+            # 正常路径下服务端已主动断开；异常路径下这里负责真正回收连接。
+            await stream.aclose()
 
     # worker 独立运行，因此下面遍历 LLM 流时不会等待当前句 TTS 完整结束。
     worker_task = asyncio.create_task(tts_worker())
@@ -652,6 +753,7 @@ async def _run_hardware_turn(
                 # run_turn 会退回普通流式对话，行为与改造前完全一致。
                 tools=hardware_tools,
                 execute_tool=execute_hardware_tool,
+                # 只在硬件级联挂载已授权知识库检索；保留会话当前千问模型。
                 enable_knowledge_retrieval=True,
         ):
             check_cancelled()
@@ -779,7 +881,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             await client.send_json(data)
 
     async def send_bytes(data: bytes) -> None:
-        """串行发送百度 TTS 返回的 MP3 二进制帧。"""
+        """串行发送设备可播放的 MP3 二进制帧。"""
 
         async with send_lock:
             await client.send_bytes(data)
@@ -808,6 +910,98 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
     client_req: object = None
     turn_task: asyncio.Task[None] | None = None
     turn_cancel_event: asyncio.Event | None = None
+    turn_route = settings.hardware_voice_route
+    realtime_session: HardwareQwenRealtimeSession | None = None
+
+    async def abort_turn() -> None:
+        """连尚未运行到 finally 的新建 Task 也一起回收，防止上游会话泄漏。"""
+        nonlocal turn_task, turn_cancel_event, realtime_session, collecting
+        collecting = False
+        audio_parts.clear()
+        if turn_cancel_event is not None:
+            turn_cancel_event.set()
+        task, adapter = turn_task, realtime_session
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        if adapter is not None:
+            await adapter.aclose()
+        if turn_task is task:
+            turn_task = None
+            turn_cancel_event = None
+            realtime_session = None
+
+    async def run_realtime_worker(
+        adapter: HardwareQwenRealtimeSession,
+        business_session: HardwareSession,
+        worker_req: str,
+        worker_client_req: object,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        nonlocal turn_task, turn_cancel_event, realtime_session, collecting
+        try:
+            result = await adapter.wait()
+            if cancel_event.is_set():
+                return
+            await persist_hardware_realtime_turn(
+                business_session, result.asr_text, result.answer_text,
+            )
+            asyncio.create_task(summarize_conversation_in_background(
+                conversation_id=business_session.conversation_id,
+                device_id=business_session.device_id, user_id=business_session.user_id,
+                agent_id=business_session.agent_id, trace_id=worker_req,
+                model=business_session.model,
+            ))
+            # 完成消息会触发设备立即发下一轮 start；先清理旧上游和状态，
+            # 否则设备会在旧 worker 的 close 等待期间被误判为仍在对话。
+            await adapter.aclose()
+            if turn_task is asyncio.current_task():
+                turn_task = None
+                turn_cancel_event = None
+                realtime_session = None
+                collecting = False
+            await send_json({
+                "type": "dialogue.done", "req": worker_req,
+                "client_req": worker_client_req, "route": "realtime", "provider": "qwen",
+                "finish_reason": result.finish_reason,
+                "audio_bytes": result.audio_bytes, "audio_chunks": result.audio_chunks,
+                "first_chunk_ms": result.first_chunk_ms,
+                "first_provider_audio_ms": result.first_provider_audio_ms,
+                "endpoint_silence_bytes": result.endpoint_silence_bytes,
+                "endpoint_silence_chunks": result.endpoint_silence_chunks,
+                "output_pcm_bytes": result.output_pcm_bytes,
+                "output_pcm_chunks": result.output_pcm_chunks,
+                "post_endpoint_input_bytes": result.post_endpoint_input_bytes,
+                "post_endpoint_input_chunks": result.post_endpoint_input_chunks,
+                "pcm_to_first_mp3_ms": (
+                    max(0, result.first_chunk_ms - result.first_provider_audio_ms)
+                    if result.first_chunk_ms is not None and result.first_provider_audio_ms is not None
+                    else None
+                ),
+                "provider_audio_max_gap_ms": result.provider_audio_max_gap_ms,
+                "mp3_output_max_gap_ms": result.mp3_output_max_gap_ms,
+                "total_ms": int((perf_counter() - result.started_at) * 1000),
+                "action": "chat",
+            })
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.exception("[HARDWARE-QWEN][%s] 设备端到端失败", worker_req)
+            if not cancel_event.is_set():
+                await send_json({
+                    "type": "dialogue.error", "req": worker_req,
+                    "client_req": worker_client_req, "error": str(exc),
+                })
+        finally:
+            try:
+                await adapter.aclose()
+            finally:
+                if turn_task is asyncio.current_task():
+                    turn_task = None
+                    turn_cancel_event = None
+                    realtime_session = None
+                    collecting = False
 
     async def run_turn_worker(
             *,
@@ -931,6 +1125,9 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             if binary_data is not None:
                 # 防止未发 start 就上传音频导致音频归属不明。
                 if not collecting:
+                    if turn_route == "realtime" and realtime_session is not None:
+                        realtime_session.result.post_endpoint_input_bytes += len(binary_data)
+                        realtime_session.result.post_endpoint_input_chunks += 1
                     await send_json(
                         {
                             "type": "dialogue.error",
@@ -963,6 +1160,8 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     # 本轮立即作废；必须等待新的 dialogue.start 才能重新收音。
                     collecting = False
                     audio_parts.clear()
+                    if realtime_session is not None:
+                        await abort_turn()
                     await send_json(
                         {
                             "type": "dialogue.error",
@@ -970,6 +1169,14 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                             "error": "audio payload too large",
                         }
                     )
+                    continue
+                if turn_route == "realtime":
+                    if realtime_session is None or not realtime_session.append_audio(binary_data):
+                        await abort_turn()
+                        await send_json({
+                            "type": "dialogue.error", "req": request_id,
+                            "client_req": client_req, "error": "realtime input queue unavailable or full",
+                        })
                     continue
                 # 此处不解析 Speex 帧，因为一个 Speex 帧可能跨多个 WebSocket 消息；
                 # 等 dialogue.end 拼成完整字节流后统一解析更可靠。
@@ -1033,10 +1240,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 continue
 
             if command_type == "dialogue.cancel":
-                if turn_cancel_event is not None:
-                    turn_cancel_event.set()
-                if turn_task is not None and not turn_task.done():
-                    turn_task.cancel()
+                await abort_turn()
                 await send_json(
                     {
                         "type": "dialogue.cancelled",
@@ -1063,9 +1267,21 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                         }
                     )
                     continue
+                if collecting:
+                    await send_json({
+                        "type": "dialogue.error", "req": request_id,
+                        "client_req": client_req, "error": "previous dialogue is still collecting audio",
+                    })
+                    continue
                 # 固件可传 req 便于两端日志对应；限制长度防止日志字段被滥用。
                 request_id = uuid.uuid4().hex[:8]
                 client_req = command.get("client_req", command.get("req"))
+                turn_route = str(
+                    command.get("route") or client.query_params.get("route") or settings.hardware_voice_route
+                ).lower()
+                if turn_route not in {"cascade", "realtime"}:
+                    await send_json({"type": "dialogue.error", "req": request_id, "error": "route must be cascade or realtime"})
+                    continue
                 device_sn = str(
                     command.get("device_sn") or connection_device_sn
                 ).strip()
@@ -1093,6 +1309,12 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                             "error": "audio_format must be pcm or speex",
                         }
                     )
+                    continue
+                if turn_route == "realtime" and audio_format != "pcm":
+                    await send_json({
+                        "type": "dialogue.error", "req": request_id,
+                        "error": "realtime route requires 16kHz 16bit mono PCM input; use route=cascade for Speex",
+                    })
                     continue
                 # 当前硬件协议和百度 ASR 都固定 16k；拒绝其他采样率，避免声音变速、
                 # 时长计算错误或识别率异常。
@@ -1188,11 +1410,47 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 first_audio_frame_at = None
                 collecting = True
                 turn_started_at = perf_counter()
+                if turn_route == "realtime":
+                    # 捕获本轮上下文，不能让下一轮的 Agent/取消状态影响迟到回调。
+                    business_session = session
+                    realtime_cancel = asyncio.Event()
+
+                    async def forward_realtime_audio(chunk: bytes, event: asyncio.Event = realtime_cancel) -> None:
+                        if event.is_set():
+                            raise asyncio.CancelledError()
+                        await send_bytes(chunk)
+
+                    async def retrieve_realtime(
+                        query: str, context: HardwareSession = business_session, trace: str = request_id,
+                    ) -> str:
+                        return await retrieve_hardware_realtime_references(context, query, trace)
+
+                    realtime_session = HardwareQwenRealtimeSession(
+                        instructions=build_hardware_realtime_instructions(business_session),
+                        trace_id=request_id, send_audio=forward_realtime_audio,
+                        retrieve_references=retrieve_realtime, started_at=turn_started_at,
+                    )
+                    try:
+                        await realtime_session.start()
+                    except Exception as exc:  # noqa: BLE001 -- 上游建连错误统一返回设备协议错误
+                        collecting = False
+                        await realtime_session.aclose()
+                        realtime_session = None
+                        await send_json({
+                            "type": "dialogue.error", "req": request_id,
+                            "client_req": client_req, "error": str(exc),
+                        })
+                        continue
+                    turn_cancel_event = realtime_cancel
+                    turn_task = asyncio.create_task(run_realtime_worker(
+                        realtime_session, business_session, request_id, client_req, realtime_cancel,
+                    ))
                 # ready 表示服务端已经准备好接收本轮二进制音频。
                 await send_json(
                     {
                         "type": "dialogue.ready",
                         "req": request_id,
+                        "route": turn_route,
                         "client_req": client_req,
                     }
                 )
@@ -1209,7 +1467,10 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
 
             # ==================== 控制消息：dialogue.end ====================
             # 未识别的控制消息目前忽略，便于以后扩展 cancel/config 等消息。
-            if command_type != "dialogue.end":
+            if command_type not in {"dialogue.end", "dialogue.commit"}:
+                continue
+            if turn_route == "realtime" and not collecting and realtime_session is not None:
+                # 固件可能重复发送 end/commit；不创建第二个回答。
                 continue
             # end 必须和前面的 start 配对，session 也必须已通过数据库校验。
             if not collecting or session is None:
@@ -1220,6 +1481,25 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                         "error": "dialogue.end before dialogue.start",
                     }
                 )
+                continue
+
+            if turn_route == "realtime":
+                collecting = False
+                error = None
+                if received_bytes == 0:
+                    error = "empty audio payload"
+                elif received_bytes % 2:
+                    error = "PCM byte count must be even"
+                elif expected_audio_bytes is not None and expected_audio_bytes != received_bytes:
+                    error = f"audio size mismatch: expected {expected_audio_bytes}, got {received_bytes}"
+                elif realtime_session is None or not realtime_session.commit():
+                    error = "realtime capture-finish handling failed"
+                if error:
+                    await abort_turn()
+                    await send_json({
+                        "type": "dialogue.error", "req": request_id,
+                        "client_req": client_req, "error": error,
+                    })
                 continue
 
             # 从这一刻开始本轮不再接收音频；将分片一次性拼成 Speex/PCM 字节流。
@@ -1286,6 +1566,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             turn_task.cancel()
         return
     finally:
+        await abort_turn()
         # finally 保证正常断线、异常退出、任务取消三种路径都有离线日志。
         logger.info(
             "[HARDWARE-VOICE][%s][连接] WebSocket 已断开 "

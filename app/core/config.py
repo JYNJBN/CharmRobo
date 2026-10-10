@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -49,6 +51,31 @@ class Settings(BaseSettings):
     # 写进系统提示词的模型名。用户问"你是什么模型"时模型会照这个回答，
     # 换硬件模型时这里要同步改，否则会答成上一代模型。
     hardware_llm_label: str = "通义千问"
+    # 设备默认走千问端到端；dialogue.start.route=cascade 可切回原级联。
+    # 与小程序 QWEN_AUDIO_REALTIME_* 配置独立，默认沿用同事设备方案。
+    hardware_voice_route: Literal["cascade", "realtime"] = "realtime"
+    hardware_qwen_realtime_api_key: SecretStr | None = None
+    hardware_qwen_realtime_ws_url: str = (
+        "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+    )
+    hardware_qwen_realtime_model: str = "qwen3.5-omni-flash-realtime"
+    hardware_qwen_realtime_voice: str = "Tina"
+    hardware_qwen_realtime_transcription_model: str = "gummy-realtime-v1"
+    hardware_qwen_realtime_enable_search: bool = True
+    hardware_qwen_realtime_tail_silence_ms: int = Field(default=200, ge=0, le=2000)
+    hardware_qwen_realtime_system_prompt: str = (
+        "你的名字叫小梦，是深圳市创梦龙科技有限公司研发的智能机器人端到端实时语音助手。"
+        "回答要自然口语化，普通问题优先一句话，最多两句话；"
+        "用户要求背诵、讲故事或完整读出内容时要保证完整；不要使用列表、换行或特殊符号。"
+    )
+    hardware_qwen_connect_timeout_seconds: float = Field(default=12, gt=0)
+    hardware_qwen_asr_timeout_seconds: float = Field(default=15, gt=0)
+    hardware_qwen_first_response_timeout_seconds: float = Field(default=15, gt=0)
+    hardware_qwen_output_idle_timeout_seconds: float = Field(default=6, gt=0)
+    hardware_qwen_capture_timeout_seconds: float = Field(default=90, gt=0)
+    hardware_qwen_retrieval_timeout_seconds: float = Field(default=3, gt=0)
+    hardware_qwen_queue_size: int = Field(default=512, ge=8, le=4096)
+    hardware_qwen_mp3_bitrate: str = "64k"
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str = (
         "https://dashscope.aliyuncs.com/compatible-mode/v1"

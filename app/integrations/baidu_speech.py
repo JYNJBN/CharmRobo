@@ -41,6 +41,11 @@ TokenKind = Literal["asr", "tts"]
 # 只允许重试一次，防止凭据或权限确实错误时形成无限请求循环。
 AUTH_ERROR_CODES = {110, 111, 3302, 401, 403}
 
+# 复用型 TTS 会话等待下一帧音频的上限。会话模式下句子之间可能长时间没有
+# 音频（LLM 仍在生成后续文字），所以比单句模式宽得多；它只用来兜住
+# 「服务端卡死不再回包」这种异常，正常对话永远碰不到。
+TTS_RECV_TIMEOUT_SECONDS = 60.0
+
 
 class BaiduSpeechError(RuntimeError):
     """百度语音接口调用失败。"""
@@ -48,6 +53,128 @@ class BaiduSpeechError(RuntimeError):
 
 class _BaiduAuthError(BaiduSpeechError):
     """百度凭据或 Access Token 失效。"""
+
+
+class BaiduTtsSession:
+    """一条可复用的百度流式 TTS 会话。
+
+    与 ``stream_synthesize_mp3``（每个短句都新建一条 WebSocket、重新走一遍
+    TLS 握手和 ``system.start`` → ``system.started`` 往返）不同，本类只在
+    ``open_tts_stream`` 里握手一次，之后可以边追加短句边接收音频。
+
+    硬件语音链路依赖这个差异压低「用户听到第一个字」的延迟：握手被挪到
+    ASR / 记忆检索 / LLM 首字那段时间里并行完成，第一句到达时连接通常
+    已经就绪，直接发文本即可。
+
+    典型用法（发送与接收并发）：
+
+    ``session = await client.open_tts_stream(per=...)``
+    ``recv_task = asyncio.create_task(pump(session.iter_audio()))``
+    ``await session.send_text(第一句)`` … ``await session.finish()``
+    ``await recv_task`` … ``await session.aclose()``
+
+    生命周期注意：``finish`` 之后不能再 ``send_text``（百度侧不再接收任何
+    请求）；任何失败路径都必须 ``aclose``，否则连接会泄漏到进程关闭为止。
+    """
+
+    def __init__(self, websocket, *, per: str) -> None:
+        self.websocket = websocket
+        self.per = per
+        # finish 一旦发送，服务端就不再接受新文本；这里本地拦住重复调用和
+        # finish 之后的 send_text，把协议错误挡在客户端而不是等百度报错。
+        self._finished = False
+        self._closed = False
+
+    async def send_text(self, text: str) -> None:
+        """追加一句待合成文本，不等待音频返回。
+
+        空文本直接忽略：百度对「发送文本信息无内容」不做响应，发过去只会
+        换来一次静默，不如本地跳过。
+        """
+
+        if self._finished:
+            raise BaiduSpeechError("百度 TTS 会话已结束，无法继续发送文本")
+        normalized = text.strip()
+        if not normalized:
+            return
+        await self.websocket.send(
+            json.dumps(
+                {"type": "text", "payload": {"text": normalized}},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    async def finish(self) -> None:
+        """声明没有更多文本，要求服务端立即合成缓冲区里的内容。
+
+        百度会缓存客户端文本并分句合成，缺少这个控制帧会导致尾部文字一直
+        不被合成。重复调用安全。
+        """
+
+        if self._finished or self._closed:
+            return
+        await self.websocket.send('{"type":"system.finish"}')
+        self._finished = True
+
+    async def iter_audio(self) -> AsyncIterator[bytes]:
+        """持续产出音频分片，直到服务端下发 ``system.finished``。
+
+        本生成器应当在独立任务里与 ``send_text`` 并发运行，这正是百度流式
+        合成「边送文本边收音频」的全双工用法。服务端把所有缓存文本合成为
+        一段连续音频，因此分片之间不会再有「每句一次握手」造成的空档。
+        """
+
+        received_audio = False
+        try:
+            while True:
+                frame = await asyncio.wait_for(
+                    self.websocket.recv(),
+                    timeout=TTS_RECV_TIMEOUT_SECONDS,
+                )
+                if isinstance(frame, bytes):
+                    # 二进制消息是原始 MP3 字节，直接交给上层下发。
+                    if frame:
+                        received_audio = True
+                        yield frame
+                    continue
+
+                # 文本消息是 system.finished / system.error 等控制帧。
+                message = BaiduSpeechClient._parse_tts_control_frame(frame)
+                message_type = str(message.get("type") or "")
+                code = int(message.get("code") or 0)
+                if message_type == "system.error" or code != 0:
+                    if BaiduSpeechClient._is_auth_error(message):
+                        raise _BaiduAuthError(
+                            f"百度 TTS 鉴权失败：{message.get('message') or code}"
+                        )
+                    raise BaiduSpeechError(
+                        f"百度 TTS 合成失败：{message.get('message') or code}"
+                    )
+                if message_type == "system.finished":
+                    # 收到 finished 表示所有音频二进制帧都已下发完毕。
+                    break
+        except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as exc:
+            raise BaiduSpeechError(f"百度 TTS WebSocket 失败：{exc}") from exc
+
+        if not received_audio:
+            raise BaiduSpeechError("百度 TTS 没有返回音频")
+
+    async def aclose(self) -> None:
+        """关闭底层连接；重复调用安全。
+
+        正常路径下服务端在 ``system.finished`` 后会主动断开，这里的 close
+        只是让客户端状态同步；异常路径下它负责真正回收连接。
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.websocket.close()
+        except (OSError, asyncio.TimeoutError, websockets.WebSocketException):
+            # 收尾失败不影响本轮结果，服务端最终会自行回收连接。
+            logger.debug("[百度TTS] 会话关闭时出现异常", exc_info=True)
 
 
 @dataclass
@@ -124,8 +251,8 @@ class BaiduSpeechClient:
         )
 
     def _cache_and_lock(
-        self,
-        kind: TokenKind,
+            self,
+            kind: TokenKind,
     ) -> tuple[_TokenCache, asyncio.Lock]:
         """返回指定接口的当前缓存对象和刷新锁。"""
 
@@ -304,11 +431,127 @@ class BaiduSpeechClient:
 
         raise BaiduSpeechError("百度 ASR 鉴权重试失败")
 
+    def _tts_start_frame(self) -> str:
+        """构造 ``system.start`` 控制帧。
+
+        单句模式（``_stream_tts_once``）和复用会话（``_connect_tts``）共用，
+        避免两处参数各写一份、改语速时漏掉一处。
+        """
+
+        # aue=3 表示 MP3；audio_ctrl 以 JSON 字符串形式要求降采样到 16k，
+        # 与硬件 CI 播放器和本项目协议约定一致。
+        return json.dumps(
+            {
+                "type": "system.start",
+                "payload": {
+                    "spd": self.config.baidu_tts_speed,
+                    "pit": self.config.baidu_tts_pitch,
+                    "vol": self.config.baidu_tts_volume,
+                    "aue": 3,
+                    "audio_ctrl": json.dumps(
+                        {"sampling_rate": self.config.baidu_tts_sample_rate},
+                        separators=(",", ":"),
+                    ),
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    async def open_tts_stream(self, *, per: str | None = None) -> BaiduTtsSession:
+        """建立一条可复用的 TTS 会话，并完成 ``system.start`` 握手。
+
+        返回时已经收到 ``system.started``，调用方可以立刻 ``send_text``。
+        整个会话（可能覆盖十几个短句）只发生一次连接建立和一次初始化往返，
+        这是硬件链路压低首字延迟的关键：握手可以和 ASR、记忆检索、LLM 首字
+        并行完成，不再占用「等第一句出声」的时间。
+
+        鉴权失败会刷新 Token 重试一次，与 ``stream_synthesize_mp3`` 一致；
+        此时还没有音频下发，重试不会造成重复播放。
+        """
+
+        per_value = per or self.config.baidu_tts_per
+        for attempt in range(2):
+            token = await self._get_token("tts")
+            try:
+                websocket = await self._connect_tts(token, per_value)
+            except _BaiduAuthError:
+                # 只清除这次失败使用的 Token；并发刷新出的新 Token 不会被误删。
+                self._invalidate_token("tts", token)
+                if attempt > 0:
+                    raise
+                continue
+            return BaiduTtsSession(websocket, per=per_value)
+
+        raise BaiduSpeechError("百度 TTS 鉴权重试失败")
+
+    async def _connect_tts(self, token: str, per: str):
+        """建立 WebSocket 并完成 ``system.start`` → ``system.started`` 握手。"""
+
+        query = urllib.parse.urlencode(
+            {
+                "access_token": token,
+                "per": per,
+            }
+        )
+        url = f"{self.config.baidu_tts_ws_url}?{query}"
+
+        try:
+            # open/close 超时限制握手和关闭等待；ping_interval/ping_timeout
+            # 负责底层连接保活；max_size 限制单个消息。
+            websocket = await websockets.connect(
+                url,
+                open_timeout=15,
+                close_timeout=5,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=2 * 1024 * 1024,
+            )
+        except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as exc:
+            # 握手阶段 401/403 同样归类为鉴权错误；其他连接/超时错误直接
+            # 上报，因为重新申请 Token 通常无法解决网络问题。
+            status_code = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            if status_code in {401, 403}:
+                raise _BaiduAuthError(
+                    f"百度 TTS 握手鉴权失败：HTTP {status_code}"
+                ) from exc
+            raise BaiduSpeechError(f"百度 TTS WebSocket 失败：{exc}") from exc
+
+        try:
+            await websocket.send(self._tts_start_frame())
+            # 不用固定 sleep 猜百度是否准备好，而是等待明确的 system.started。
+            started_frame = await asyncio.wait_for(websocket.recv(), timeout=20)
+            self._validate_tts_control_frame(
+                started_frame,
+                expected_type="system.started",
+            )
+        except BaseException as exc:
+            # 握手没走完就把连接关掉，避免半开连接堆积。
+            try:
+                await websocket.close()
+            except (OSError, asyncio.TimeoutError,
+                    websockets.WebSocketException):
+                logger.debug("[百度TTS] 握手失败后关闭连接异常", exc_info=True)
+            # 传输层异常统一成 BaiduSpeechError，让上层只需要处理一种错误类型；
+            # CancelledError 和真正的编程错误保持原样向上传播。
+            if isinstance(
+                    exc,
+                    (OSError, asyncio.TimeoutError,
+                     websockets.WebSocketException),
+            ):
+                raise BaiduSpeechError(f"百度 TTS 会话初始化失败：{exc}") from exc
+            raise
+        return websocket
+
     async def stream_synthesize_mp3(
-        self,
-        text: str,
-        *,
-        per: str | None = None,
+            self,
+            text: str,
+            *,
+            per: str | None = None,
     ) -> AsyncIterator[bytes]:
         """流式产出百度 TTS 返回的 16 kHz MP3 二进制分片。
 
@@ -329,9 +572,9 @@ class BaiduSpeechClient:
             token = await self._get_token("tts")
             try:
                 async for chunk in self._stream_tts_once(
-                    normalized_text[:1000],
-                    token,
-                    per=per,
+                        normalized_text[:1000],
+                        token,
+                        per=per,
                 ):
                     yielded_audio = True
                     yield chunk
@@ -346,11 +589,11 @@ class BaiduSpeechClient:
         raise BaiduSpeechError("百度 TTS 鉴权重试失败")
 
     async def _stream_tts_once(
-        self,
-        text: str,
-        token: str,
-        *,
-        per: str | None = None,
+            self,
+            text: str,
+            token: str,
+            *,
+            per: str | None = None,
     ) -> AsyncIterator[bytes]:
         """使用指定 Token 完成一次百度 TTS WebSocket 会话。
 
@@ -374,39 +617,15 @@ class BaiduSpeechClient:
             # 每个短句独立建立 TTS 会话。open/close 超时限制握手和关闭等待；
             # ping_interval/ping_timeout 负责底层连接保活；max_size 限制单个消息。
             async with websockets.connect(
-                url,
-                open_timeout=15,
-                close_timeout=5,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=2 * 1024 * 1024,
+                    url,
+                    open_timeout=15,
+                    close_timeout=5,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=2 * 1024 * 1024,
             ) as websocket:
                 # ==================== 1. 初始化合成参数 ====================
-                # aue=3 表示 MP3；audio_ctrl 以 JSON 字符串形式要求降采样到 16k，
-                # 与硬件 CI 播放器和本项目协议约定一致。
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "system.start",
-                            "payload": {
-                                "spd": self.config.baidu_tts_speed,
-                                "pit": self.config.baidu_tts_pitch,
-                                "vol": self.config.baidu_tts_volume,
-                                "aue": 3,
-                                "audio_ctrl": json.dumps(
-                                    {
-                                        "sampling_rate": (
-                                            self.config.baidu_tts_sample_rate
-                                        )
-                                    },
-                                    separators=(",", ":"),
-                                ),
-                            },
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
+                await websocket.send(self._tts_start_frame())
 
                 # 不用固定 sleep 猜百度是否准备好，而是等待明确的 system.started。
                 started_frame = await asyncio.wait_for(websocket.recv(), timeout=20)
@@ -483,10 +702,10 @@ class BaiduSpeechClient:
         return payload
 
     def _validate_tts_control_frame(
-        self,
-        frame: object,
-        *,
-        expected_type: str,
+            self,
+            frame: object,
+            *,
+            expected_type: str,
     ) -> None:
         """校验初始化响应类型和 code，并保留鉴权错误的可重试语义。"""
 
