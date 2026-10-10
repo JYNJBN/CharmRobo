@@ -23,12 +23,16 @@ from app.utils.tools import build_current_time_context
 
 
 class FakeUpstream:
-    def __init__(self, status="completed", transcribe=True):
+    def __init__(
+        self, status="completed", transcribe=True, transcript="酒店早餐几点？"
+    ):
         self.sent = []
         self.queue = asyncio.Queue()
         self.closed = False
         self.status = status
         self.transcribe = transcribe
+        self.transcript = transcript
+        self.reply = "早餐七点开始。"
         self.queue.put_nowait({"type": "session.created"})
 
     async def send(self, raw):
@@ -36,17 +40,24 @@ class FakeUpstream:
         self.sent.append(event)
         kind = event["type"]
         if kind == "session.update":
+            session = event.get("session") or {}
+            if session.get(
+                "enable_search"
+            ) is False and qwen.ASR_EMPTY_REPEAT_PROMPT in session.get(
+                "instructions", ""
+            ):
+                self.reply = qwen.ASR_EMPTY_REPEAT_PROMPT
             self.queue.put_nowait({"type": "session.updated"})
         elif kind == "input_audio_buffer.commit" and self.transcribe:
             self.queue.put_nowait(
                 {
                     "type": "conversation.item.input_audio_transcription.completed",
-                    "transcript": "酒店早餐几点？",
+                    "transcript": self.transcript,
                 }
             )
         elif kind == "response.create":
             for reply in (
-                {"type": "response.audio_transcript.delta", "delta": "早餐七点开始。"},
+                {"type": "response.audio_transcript.delta", "delta": self.reply},
                 {"type": "response.text.delta", "delta": "重复来源不可重复保存"},
                 {
                     "type": "response.audio.delta",
@@ -370,6 +381,82 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await session.aclose()
 
+    async def test_empty_asr_requests_one_voice_hint_without_retrieval(self):
+        class DuplicateEmptyAsr(FakeUpstream):
+            async def send(self, raw):
+                await super().send(raw)
+                if json.loads(raw)["type"] == "input_audio_buffer.commit":
+                    self.queue.put_nowait(
+                        {
+                            "type": "conversation.item.input_audio_transcription.completed",
+                            "transcript": "",
+                        }
+                    )
+
+        upstream = DuplicateEmptyAsr(transcript="   ")
+        retrieve = AsyncMock()
+        audio = AsyncMock()
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="酒店前台，历史问题",
+            trace_id="repeat",
+            send_audio=audio,
+            retrieve_references=retrieve,
+        )
+        with patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                result = await asyncio.wait_for(session.wait(), 1)
+                self.assertTrue(result.needs_repeat)
+                self.assertEqual(result.asr_text, "")
+                self.assertEqual(result.answer_text, qwen.ASR_EMPTY_REPEAT_PROMPT)
+                audio.assert_awaited_once_with(b"mock-mp3")
+                retrieve.assert_not_awaited()
+                self.assertEqual(
+                    sum(x["type"] == "response.create" for x in upstream.sent), 1
+                )
+                fallback = [x for x in upstream.sent if x["type"] == "session.update"][
+                    -1
+                ]["session"]
+                self.assertIs(fallback["enable_search"], False)
+                self.assertIn(qwen.ASR_EMPTY_REPEAT_PROMPT, fallback["instructions"])
+                self.assertNotIn("历史问题", fallback["instructions"])
+            finally:
+                await session.aclose()
+
+    async def test_asr_service_failure_is_not_disguised_as_repeat_prompt(self):
+        class FailedAsr(FakeUpstream):
+            async def send(self, raw):
+                await super().send(raw)
+                if json.loads(raw)["type"] == "input_audio_buffer.commit":
+                    self.queue.put_nowait(
+                        {"type": "conversation.item.input_audio_transcription.failed"}
+                    )
+
+        upstream = FailedAsr(transcribe=False)
+        retrieve = AsyncMock()
+        audio = AsyncMock()
+        session = qwen.HardwareQwenRealtimeSession(
+            instructions="persona",
+            trace_id="asr-failed",
+            send_audio=audio,
+            retrieve_references=retrieve,
+        )
+        with patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)):
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                with self.assertRaisesRegex(qwen.HardwareQwenError, "输入转写失败"):
+                    await asyncio.wait_for(session.wait(), 1)
+                self.assertFalse(session.result.needs_repeat)
+                audio.assert_not_awaited()
+                retrieve.assert_not_awaited()
+                self.assertNotIn("response.create", [x["type"] for x in upstream.sent])
+            finally:
+                await session.aclose()
+
     async def test_text_first_and_delayed_audio_can_complete_within_limit(self):
         upstream = DelayedAudioUpstream(delay=0.05)
         session = qwen.HardwareQwenRealtimeSession(
@@ -498,10 +585,38 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gateway, "_load_hardware_session", load),
             patch.object(gateway, "persist_hardware_realtime_turn", persist),
             patch.object(gateway, "retrieve_hardware_realtime_references", refs),
-            patch.object(gateway, "summarize_conversation_in_background", AsyncMock()),
+            patch.object(
+                gateway, "summarize_conversation_in_background", AsyncMock()
+            ) as summary,
         ):
             await asyncio.wait_for(gateway.hardware_dialogue_websocket(device), 3)
+            self.summary_await_count = summary.await_count
         return connections, load, persist, refs
+
+    async def test_empty_asr_hint_completes_without_writing_conversation(self):
+        device = FakeDevice()
+        connections, _, persist, refs = await self.run_gateway(
+            device, upstream_factory=lambda: FakeUpstream(transcript="")
+        )
+        self.assertEqual(device.completed, 1)
+        self.assertEqual(device.audio, [b"mock-mp3"])
+        self.assertFalse(any(x["type"] == "dialogue.error" for x in device.messages))
+        persist.assert_not_awaited()
+        refs.assert_not_awaited()
+        self.assertEqual(self.summary_await_count, 0)
+        self.assertTrue(connections[0].closed)
+
+    async def test_normal_turn_after_repeat_hint_restores_search_and_memory(self):
+        device = FakeDevice(turns=2)
+        transcripts = iter(["", "酒店早餐几点？"])
+        connections, _, persist, refs = await self.run_gateway(
+            device, upstream_factory=lambda: FakeUpstream(transcript=next(transcripts))
+        )
+        self.assertEqual(device.completed, 2)
+        persist.assert_awaited_once()
+        refs.assert_awaited_once()
+        self.assertEqual(persist.await_args.args[0].agent_id, 10)
+        self.assertTrue(connections[1].sent[0]["session"]["enable_search"])
 
     async def test_gateway_reports_timeout_code_without_success_or_persist(self):
         device = FakeDevice()

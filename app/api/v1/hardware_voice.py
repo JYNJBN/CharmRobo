@@ -951,19 +951,22 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             result = await adapter.wait()
             if cancel_event.is_set():
                 return
-            worker_phase = "会话保存"
-            phase_started_at = perf_counter()
-            await persist_hardware_realtime_turn(
-                business_session, result.asr_text, result.answer_text,
-            )
-            result.timings_ms["persistence_ms"] = int((perf_counter() - phase_started_at) * 1000)
-            logger.info("[HARDWARE-QWEN][%s][会话保存] 耗时=%dms", worker_req, result.timings_ms["persistence_ms"])
-            asyncio.create_task(summarize_conversation_in_background(
-                conversation_id=business_session.conversation_id,
-                device_id=business_session.device_id, user_id=business_session.user_id,
-                agent_id=business_session.agent_id, trace_id=worker_req,
-                model=business_session.model,
-            ))
+            if result.needs_repeat:
+                logger.info("[HARDWARE-QWEN][%s][未听清提示] 语音提示已发完，不保存问答、不生成摘要", worker_req)
+            else:
+                worker_phase = "会话保存"
+                phase_started_at = perf_counter()
+                await persist_hardware_realtime_turn(
+                    business_session, result.asr_text, result.answer_text,
+                )
+                result.timings_ms["persistence_ms"] = int((perf_counter() - phase_started_at) * 1000)
+                logger.info("[HARDWARE-QWEN][%s][会话保存] 耗时=%dms", worker_req, result.timings_ms["persistence_ms"])
+                asyncio.create_task(summarize_conversation_in_background(
+                    conversation_id=business_session.conversation_id,
+                    device_id=business_session.device_id, user_id=business_session.user_id,
+                    agent_id=business_session.agent_id, trace_id=worker_req,
+                    model=business_session.model,
+                ))
             # 完成消息会触发设备立即发下一轮 start；先清理旧上游和状态，
             # 否则设备会在旧 worker 的 close 等待期间被误判为仍在对话。
             worker_phase = "上游清理"

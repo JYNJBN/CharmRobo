@@ -28,6 +28,8 @@ from app.utils.tools import BEIJING_TIMEZONE, build_current_time_context, local_
 
 logger = logging.getLogger(__name__)
 
+ASR_EMPTY_REPEAT_PROMPT = "我没听清，请再说一遍。"
+
 
 class HardwareQwenError(RuntimeError):
     """设备千问上游、协议或音频错误。"""
@@ -69,6 +71,7 @@ class HardwareQwenResult:
     finish_reason: str = ""
     search_count: int | None = None
     timings_ms: dict[str, int] = field(default_factory=dict)
+    needs_repeat: bool = False
 
 
 class HardwareQwenRealtimeSession:
@@ -102,6 +105,7 @@ class HardwareQwenRealtimeSession:
         self._commit_enqueued = False
         self._committed = False
         self._response_requested = False
+        self._active_search_enabled = settings.hardware_qwen_realtime_enable_search
         self._context_update_event_id: str | None = None
         self._deadline: float = 0
         self._phase = "配置会话"
@@ -549,8 +553,6 @@ class HardwareQwenRealtimeSession:
                     or event.get("text")
                     or "".join(self._asr_parts)
                 ).strip()
-                if not self.result.asr_text:
-                    raise HardwareQwenError("没有识别到有效语音，请重试")
                 self._mark("asr_done")
                 logger.info(
                     "[HARDWARE-QWEN][%s][识别完成] commit后=%sms 录音结束后=%sms 内容=%s",
@@ -559,20 +561,38 @@ class HardwareQwenRealtimeSession:
                     self._duration("capture_end", "asr_done"),
                     self.result.asr_text,
                 )
-                self._mark("retrieval_start")
-                self._phase = "本轮资料检索"
-                references = await self._retrieve_references(self.result.asr_text)
-                self._mark("retrieval_done")
-                logger.info(
-                    "[HARDWARE-QWEN][%s][资料检索] 总耗时=%sms 参考字数=%d",
-                    self.trace_id,
-                    self._duration("retrieval_start", "retrieval_done"),
-                    len(references),
-                )
-                instructions = self._turn_instructions(references)
+                if not self.result.asr_text:
+                    self.result.needs_repeat = True
+                    self._active_search_enabled = False
+                    instructions = (
+                        "本轮音频未识别到有效文本。不要猜测用户说了什么，"
+                        "不回应之前的对话，不使用业务人设、知识库或联网搜索。"
+                        f"只用当前音色清晰地说这一句话：{ASR_EMPTY_REPEAT_PROMPT}"
+                        "不要补充其他内容，不要说网络错误。"
+                    )
+                    logger.info(
+                        "[HARDWARE-QWEN][%s][未听清提示] 转写完成但文本为空，跳过检索和记忆保存，准备播报=%s",
+                        self.trace_id,
+                        ASR_EMPTY_REPEAT_PROMPT,
+                    )
+                else:
+                    self._mark("retrieval_start")
+                    self._phase = "本轮资料检索"
+                    references = await self._retrieve_references(self.result.asr_text)
+                    self._mark("retrieval_done")
+                    logger.info(
+                        "[HARDWARE-QWEN][%s][资料检索] 总耗时=%sms 参考字数=%d",
+                        self.trace_id,
+                        self._duration("retrieval_start", "retrieval_done"),
+                        len(references),
+                    )
+                    instructions = self._turn_instructions(references)
                 self._mark("context_update")
+                updated_session: dict[str, Any] = {"instructions": instructions}
+                if self.result.needs_repeat:
+                    updated_session["enable_search"] = False
                 self._context_update_event_id = await self._send(
-                    "session.update", session={"instructions": instructions}
+                    "session.update", session=updated_session
                 )
                 self._phase = "本轮参考资料更新确认"
                 self._deadline = (
@@ -597,7 +617,7 @@ class HardwareQwenRealtimeSession:
                     self.trace_id,
                     self._duration("context_update", "context_confirmed"),
                     self._duration("capture_end", "response_requested"),
-                    settings.hardware_qwen_realtime_enable_search,
+                    self._active_search_enabled,
                     settings.hardware_qwen_first_response_timeout_seconds,
                 )
             elif event_type == "response.created":
@@ -697,7 +717,7 @@ class HardwareQwenRealtimeSession:
                     self.trace_id,
                     self._duration("response_requested", "response_done"),
                     len(self.result.answer_text),
-                    settings.hardware_qwen_realtime_enable_search,
+                    self._active_search_enabled,
                     self.result.search_count
                     if self.result.search_count is not None
                     else "未返回",
