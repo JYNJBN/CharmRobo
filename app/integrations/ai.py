@@ -33,6 +33,8 @@ def _thinking_extra_body(
     thinking_type = model_config.get("thinking_type")
     if not thinking_type:
         return None
+    if model_config.get("provider") == "qwen":
+        return {"enable_thinking": thinking_type != "disabled"}
     return {"thinking": {"type": thinking_type}}
 
 
@@ -292,7 +294,7 @@ async def _close_stream(stream: Any) -> None:
         return
     try:
         await close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.debug("关闭上游 LLM 流失败（不影响本轮结果）", exc_info=True)
 
 

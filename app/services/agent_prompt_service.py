@@ -2,7 +2,6 @@ from app.core.config import settings
 from app.core.errors import BizError
 from app.integrations.ai import chat
 from app.schemas.Model import ModelRegistryObject
-from app.services.model_service import resolve_model
 
 POLISH_INSTRUCTIONS = """
 你是一名专业的智能体提示词编辑器。
@@ -28,11 +27,17 @@ async def polish_agent_prompt(*, name: str | None = None, system_prompt: str) ->
     draft_prompt = system_prompt.strip()
     if not draft_prompt:
         raise BizError("请先填写智能体设定", code=400)
-    # 使用当前豆包配置作为基础，只替换成低延迟美化模型。
-    base_model = resolve_model("doubao")
+    # 美化独立使用千问的地址和 Key，不依赖 Agent 可选模型注册表。
+    # 即使没有配置 QWEN_MODEL，只要美化模型和 QWEN_API_KEY 可用也可请求。
+    qwen_key = settings.qwen_api_key
+    if qwen_key is None or not qwen_key.get_secret_value().strip():
+        raise BizError("提示词美化未配置 QWEN_API_KEY", code=503)
     polish_model: ModelRegistryObject = {
-        **base_model,
+        "provider": "qwen",
+        "api_key": qwen_key,
+        "base_url": settings.qwen_base_url,
         "model_id": settings.agent_prompt_polish_model,
+        "protocol": "chat_completions",
         "thinking_type": "disabled",
     }
     agent_name = (name or "未命名智能体").strip()

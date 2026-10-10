@@ -214,8 +214,8 @@ class Settings(BaseSettings):
     #      必须清空 collection 重新灌数据，否则相似度分数无意义。
     embedding_dimension: int = 1024
     embedding_metric_type: str = "COSINE"
-    # 一键美化智能体提示词使用的低延迟模型
-    agent_prompt_polish_model: str = "doubao-seed-2-0-mini-260428"
+    # 提示词美化独立使用千问文字模型，通过 QWEN_API_KEY/QWEN_BASE_URL 请求。
+    agent_prompt_polish_model: str = "qwen3.7-flash"
     # 长期记忆最低余弦相似度。当前 Milvus 使用 COSINE，分数越大越相关；
     # 低于该值的 Top-K 候选不会回传给模型，避免不相关摘要干扰回答。
     memory_min_similarity: float = Field(default=0.55, ge=-1, le=1)

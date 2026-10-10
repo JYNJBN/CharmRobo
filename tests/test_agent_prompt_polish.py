@@ -1,6 +1,7 @@
 """提示词美化 POST 路由与服务验证；不调用外部模型或数据库。"""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from app.api.v1.router import api_router
 from app.core.database import get_db
 from app.core.errors import BizError
 from app.core.exception_handlers import biz_error_handler
+from app.integrations import ai
 from app.services import agent_prompt_service as service
 
 
@@ -61,17 +63,45 @@ class PolishRouteTests(unittest.TestCase):
 
 
 class PolishServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_polish_uses_configured_model_and_preserves_credentials(self):
-        base_model = {
-            "provider": "ark",
-            "api_key": SecretStr("fake-test-key"),
-            "base_url": "https://example.invalid",
-            "model_id": "original-model",
-            "protocol": "chat_completions",
-            "thinking_type": None,
-        }
+    async def test_actual_chat_request_uses_qwen_thinking_parameter(self):
+        key = SecretStr("fake-qwen-key")
+        completion = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content="美化后的提示词"))
+                ],
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=completion))
+        )
         with (
-            patch.object(service, "resolve_model", return_value=base_model) as resolve,
+            patch.object(service.settings, "qwen_api_key", key),
+            patch.object(
+                service.settings, "agent_prompt_polish_model", "qwen3.7-flash"
+            ),
+            patch.object(ai, "get_model_client", return_value=client) as factory,
+        ):
+            result = await service.polish_agent_prompt(system_prompt="酒店前台")
+        self.assertEqual(result, "美化后的提示词")
+        self.assertIs(factory.call_args.args[0]["api_key"], key)
+        self.assertEqual(completion.await_args.kwargs["model"], "qwen3.7-flash")
+        self.assertEqual(
+            completion.await_args.kwargs["extra_body"], {"enable_thinking": False}
+        )
+        self.assertEqual(
+            ai._thinking_extra_body({"provider": "ark", "thinking_type": "disabled"}),
+            {"thinking": {"type": "disabled"}},
+        )
+
+    async def test_polish_uses_qwen_key_url_and_independent_model(self):
+        qwen_key = SecretStr("fake-qwen-key")
+        with (
+            patch.object(service.settings, "qwen_api_key", qwen_key),
+            patch.object(
+                service.settings, "qwen_base_url", "https://example.invalid/qwen"
+            ),
+            patch.object(service.settings, "qwen_model", None),
             patch.object(service.settings, "agent_prompt_polish_model", "polish-model"),
             patch.object(
                 service, "chat", AsyncMock(return_value="  美化后的提示词  ")
@@ -81,13 +111,24 @@ class PolishServiceTests(unittest.IsolatedAsyncioTestCase):
                 name="酒店", system_prompt="  酒店前台  "
             )
         self.assertEqual(result, "美化后的提示词")
-        resolve.assert_called_once_with("doubao")
         model = chat.await_args.kwargs["model"]
+        self.assertEqual(model["provider"], "qwen")
         self.assertEqual(model["model_id"], "polish-model")
-        self.assertIs(model["api_key"], base_model["api_key"])
-        self.assertEqual(model["base_url"], base_model["base_url"])
+        self.assertIs(model["api_key"], qwen_key)
+        self.assertEqual(model["base_url"], "https://example.invalid/qwen")
         self.assertEqual(model["thinking_type"], "disabled")
-        self.assertEqual(base_model["model_id"], "original-model")
+
+    async def test_missing_qwen_key_does_not_fall_back_to_ark(self):
+        for key in (None, SecretStr("")):
+            with (
+                patch.object(service.settings, "qwen_api_key", key),
+                patch.object(service, "chat", AsyncMock()) as chat,
+                self.assertRaises(BizError) as caught,
+            ):
+                await service.polish_agent_prompt(system_prompt="酒店前台")
+            self.assertEqual(caught.exception.code, 503)
+            self.assertIn("QWEN_API_KEY", caught.exception.message)
+            chat.assert_not_awaited()
 
     async def test_blank_input_is_rejected_before_calling_model(self):
         with (
