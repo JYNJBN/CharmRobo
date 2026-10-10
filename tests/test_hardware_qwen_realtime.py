@@ -300,6 +300,58 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
                 await session.aclose()
         self.assertTrue(upstream.closed)
 
+    async def test_qwen_audio_flash_uses_builtin_asr_and_compatible_voice(self):
+        class StrictAudio(FakeUpstream):
+            async def send(self, raw):
+                event_data = json.loads(raw)
+                if (
+                    event_data["type"] == "session.update"
+                    and "voice" in event_data["session"]
+                ):
+                    config = event_data["session"]
+                    if (
+                        config["voice"] != "longanqian"
+                        or "input_audio_transcription" in config
+                    ):
+                        raise ValueError(
+                            "Audio 3.0 received incompatible Omni parameters"
+                        )
+                await super().send(raw)
+
+        upstream = StrictAudio()
+        with (
+            patch.object(
+                qwen.settings,
+                "hardware_qwen_realtime_model",
+                "qwen-audio-3.0-realtime-flash",
+            ),
+            patch.object(qwen.settings, "hardware_qwen_realtime_voice", "Tina"),
+            patch.object(qwen.websockets, "connect", AsyncMock(return_value=upstream)),
+        ):
+            retrieve = AsyncMock(return_value="知识库资料")
+            audio = AsyncMock()
+            session = qwen.HardwareQwenRealtimeSession(
+                instructions="persona",
+                trace_id="audio-flash",
+                send_audio=audio,
+                retrieve_references=retrieve,
+            )
+            await session.start()
+            try:
+                session.append_audio(b"\0\0")
+                session.commit()
+                result = await asyncio.wait_for(session.wait(), 1)
+                self.assertEqual(result.answer_text, "早餐七点开始。")
+                self.assertEqual(session._voice, "longanqian")
+                retrieve.assert_awaited_once()
+                audio.assert_awaited_once_with(b"mock-mp3")
+                config = upstream.sent[0]["session"]
+                self.assertNotIn("input_audio_transcription", config)
+                self.assertEqual(config["input_audio_format"], "pcm")
+                self.assertEqual(config["output_audio_format"], "pcm")
+            finally:
+                await session.aclose()
+
     async def test_date_is_refreshed_after_capture_crosses_beijing_midnight(self):
         upstream = FakeUpstream()
         session = qwen.HardwareQwenRealtimeSession(
@@ -635,6 +687,36 @@ class HardwareQwenTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(device.audio)
         self.assertTrue(connections[0].closed)
 
+    async def test_initial_configuration_failure_is_logged_before_device_disconnects(
+        self,
+    ):
+        class RejectedConfig(FakeUpstream):
+            async def send(self, raw):
+                data = json.loads(raw)
+                if data["type"] == "session.update":
+                    self.sent.append(data)
+                    self.queue.put_nowait(
+                        {"type": "error", "error": {"message": "unsupported voice"}}
+                    )
+                else:
+                    await super().send(raw)
+
+        device = FakeDevice()
+        with self.assertLogs(gateway.logger, level="ERROR") as captured:
+            connections, _, persist, _ = await self.run_gateway(
+                device, upstream_factory=RejectedConfig
+            )
+        self.assertTrue(
+            any(
+                "初始化失败" in line and "unsupported voice" in line
+                for line in captured.output
+            )
+        )
+        self.assertEqual(device.messages[-1]["type"], "dialogue.error")
+        self.assertIn("unsupported voice", device.messages[-1]["error"])
+        self.assertTrue(connections[0].closed)
+        persist.assert_not_awaited()
+
     async def test_device_two_turns_reload_agent_and_keep_memory(self):
         device = FakeDevice(turns=2)
         connections, load, persist, refs = await self.run_gateway(device)
@@ -817,6 +899,43 @@ class BeijingClockTests(unittest.TestCase):
         self.assertIn("2026-10-10 00:30:00", text)
         self.assertIn("今天是2026年10月10日，星期六", text)
         self.assertIn("UTC+08:00", text)
+
+
+class QwenSessionFamilyTests(unittest.TestCase):
+    def test_audio_family_uses_model_specific_default_voice_without_omni_asr(self):
+        for model, voice in (
+            ("qwen-audio-3.0-realtime-plus", "longanqian"),
+            ("qwen-audio-3.0-realtime-flash", "longanqian"),
+            ("qwen-audio-3.1-realtime-plus", "longanqian_v3.1"),
+        ):
+            config = qwen.build_hardware_qwen_session_config(
+                model=model, voice="Tina", instructions="prompt"
+            )
+            self.assertEqual(config["voice"], voice)
+            self.assertNotIn("input_audio_transcription", config)
+            self.assertIsNone(config["turn_detection"])
+
+    def test_omni_family_keeps_tina_and_configured_transcription(self):
+        with patch.object(
+            qwen.settings,
+            "hardware_qwen_realtime_transcription_model",
+            "qwen3-asr-flash-realtime",
+        ):
+            config = qwen.build_hardware_qwen_session_config(
+                model="qwen3.8-omni-flash-realtime", voice="Tina", instructions="prompt"
+            )
+        self.assertEqual(config["voice"], "Tina")
+        self.assertEqual(
+            config["input_audio_transcription"], {"model": "qwen3-asr-flash-realtime"}
+        )
+
+    def test_custom_audio_voice_is_not_overwritten(self):
+        config = qwen.build_hardware_qwen_session_config(
+            model="qwen-audio-3.0-realtime-flash",
+            voice="my-cloned-voice",
+            instructions="prompt",
+        )
+        self.assertEqual(config["voice"], "my-cloned-voice")
 
 
 class ConversationOwnershipTests(unittest.IsolatedAsyncioTestCase):

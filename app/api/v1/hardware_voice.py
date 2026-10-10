@@ -1456,13 +1456,20 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     )
                     try:
                         await realtime_session.start()
-                    except Exception as exc:  # noqa: BLE001 -- 上游建连错误统一返回设备协议错误
+                    except Exception as exc:
+                        logger.exception(
+                            "[HARDWARE-QWEN][%s][初始化失败] model=%s 请求音色=%s",
+                            request_id, settings.hardware_qwen_realtime_model,
+                            settings.hardware_qwen_realtime_voice,
+                        )
                         collecting = False
                         await realtime_session.aclose()
                         realtime_session = None
                         await send_json({
                             "type": "dialogue.error", "req": request_id,
                             "client_req": client_req, "error": str(exc),
+                            "error_code": getattr(exc, "error_code", "hardware_voice_error"),
+                            "retryable": bool(getattr(exc, "retryable", False)),
                         })
                         continue
                     turn_cancel_event = realtime_cancel

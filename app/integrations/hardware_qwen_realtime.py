@@ -31,6 +31,38 @@ logger = logging.getLogger(__name__)
 ASR_EMPTY_REPEAT_PROMPT = "我没听清，请再说一遍。"
 
 
+def build_hardware_qwen_session_config(
+    *,
+    model: str,
+    voice: str,
+    instructions: str,
+) -> dict[str, Any]:
+    """Qwen Audio 与 Omni 使用不同音色和转写配置，不能只替换 model。"""
+    session: dict[str, Any] = {
+        "modalities": ["text", "audio"],
+        "voice": voice,
+        "instructions": instructions,
+        "turn_detection": None,
+        "enable_search": settings.hardware_qwen_realtime_enable_search,
+        "input_audio_format": "pcm",
+        "output_audio_format": "pcm",
+    }
+    if model.startswith("qwen-audio-"):
+        # Audio 3.x 默认内置转写；Omni 的 input_audio_transcription.model 不适用。
+        # 仅转换遗留的 Omni 默认音色，其他用户配置/复刻音色仍原样传给上游。
+        if voice == "Tina":
+            session["voice"] = (
+                "longanqian_v3.1"
+                if model.startswith("qwen-audio-3.1-")
+                else "longanqian"
+            )
+    else:
+        session["input_audio_transcription"] = {
+            "model": settings.hardware_qwen_realtime_transcription_model,
+        }
+    return session
+
+
 class HardwareQwenError(RuntimeError):
     """设备千问上游、协议或音频错误。"""
 
@@ -86,6 +118,7 @@ class HardwareQwenRealtimeSession:
     ) -> None:
         self.instructions = instructions
         self.trace_id = trace_id
+        self._voice = settings.hardware_qwen_realtime_voice
         self._send_audio = send_audio
         self._retrieve_references = retrieve_references
         self.result = HardwareQwenResult(started_at=started_at or time.perf_counter())
@@ -311,18 +344,23 @@ class HardwareQwenRealtimeSession:
             )
             # 与同事一样通过 instructions 传入人设和上下文，不新增多条 system item。
             self._mark("session_config_start")
+            session_config = build_hardware_qwen_session_config(
+                model=settings.hardware_qwen_realtime_model,
+                voice=settings.hardware_qwen_realtime_voice,
+                instructions=self._turn_instructions(),
+            )
+            self._voice = str(session_config["voice"])
+            if self._voice != settings.hardware_qwen_realtime_voice:
+                logger.warning(
+                    "[HARDWARE-QWEN][%s][音色适配] model=%s 不使用 Omni 音色=%s，本轮使用=%s；可通过 HARDWARE_QWEN_REALTIME_VOICE 指定匹配音色",
+                    self.trace_id,
+                    settings.hardware_qwen_realtime_model,
+                    settings.hardware_qwen_realtime_voice,
+                    self._voice,
+                )
             await self._send(
                 "session.update",
-                session={
-                    "modalities": ["text", "audio"],
-                    "voice": settings.hardware_qwen_realtime_voice,
-                    "instructions": self._turn_instructions(),
-                    "turn_detection": None,
-                    "enable_search": settings.hardware_qwen_realtime_enable_search,
-                    "input_audio_transcription": {
-                        "model": settings.hardware_qwen_realtime_transcription_model
-                    },
-                },
+                session=session_config,
             )
             while True:
                 event = await self._recv()
@@ -377,7 +415,7 @@ class HardwareQwenRealtimeSession:
                 "[HARDWARE-QWEN][%s] 已就绪 model=%s voice=%s enable_search=%s",
                 self.trace_id,
                 settings.hardware_qwen_realtime_model,
-                settings.hardware_qwen_realtime_voice,
+                self._voice,
                 settings.hardware_qwen_realtime_enable_search,
             )
         except BaseException:
