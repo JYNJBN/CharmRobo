@@ -53,3 +53,22 @@ class AgentResponse(BaseModel):
     active: bool = False
     # 是否为设备 fork 自默认模板的兜底副本（不可删除，由后端计算）
     is_default: bool = False
+
+
+class AgentPromptPolishRequest(BaseModel):
+    """一键美化智能体提示词请求。"""
+
+    name: str | None = Field(
+        default=None,
+        max_length=32,
+    )
+    system_prompt: str = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+
+class AgentPromptPolishResponse(BaseModel):
+    """一键美化智能体提示词响应。"""
+
+    system_prompt: str

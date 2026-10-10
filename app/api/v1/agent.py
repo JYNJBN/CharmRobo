@@ -5,11 +5,14 @@ from app.schemas.agent import (
     AgentCreate,
     AgentModelOption,
     AgentOptionsResponse,
+    AgentPromptPolishRequest,
+    AgentPromptPolishResponse,
     AgentResponse,
     AgentUpdate,
     AgentVoiceOption,
 )
 from app.schemas.common import ApiResponse
+from app.services.agent_prompt_service import polish_agent_prompt
 from app.services.agent_service import (
     activate_agent,
     create_agent,
@@ -48,6 +51,25 @@ async def get_agent_options() -> ApiResponse[AgentOptionsResponse]:
     ]
     return ApiResponse(
         data=AgentOptionsResponse(models=models, voices=voices)
+    )
+
+
+@router.post(
+    "/polish-prompt",
+    response_model=ApiResponse[AgentPromptPolishResponse],
+)
+async def polish_agent_prompt_api(
+        data: AgentPromptPolishRequest,
+) -> ApiResponse[AgentPromptPolishResponse]:
+    polished_prompt = await polish_agent_prompt(
+        name=data.name,
+        system_prompt=data.system_prompt,
+    )
+
+    return ApiResponse(
+        data=AgentPromptPolishResponse(
+            system_prompt=polished_prompt,
+        )
     )
 
 
