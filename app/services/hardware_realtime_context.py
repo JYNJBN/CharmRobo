@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+HARDWARE_REALTIME_OPENING_RULES = (
+    "对话开头规则：身份说明是背景信息，不是每轮开场白模板。"
+    "直接回答本轮用户的问题，不要习惯性先说‘你好，我是小梦’或介绍研发公司。"
+    "只有本轮用户明确询问你的身份、名字、当前智能体、研发方或模型时，"
+    "才回答被询问的对应信息，不额外附带整段自我介绍。"
+    "用户只说‘你好’时简短回应问候即可，不接自我介绍。"
+    "重新连接、开始新一轮或切换智能体不代表用户要求介绍你自己。"
+    "历史对话里出现的自我介绍只是过去的回答，不能作为本轮固定开头。"
+)
+
 
 def build_hardware_realtime_instructions(session: HardwareSession) -> str:
     """沿用同事的语音风格，叠加当前 Agent 人设与最近对话。"""
@@ -50,6 +60,8 @@ def build_hardware_realtime_instructions(session: HardwareSession) -> str:
         parts.append(
             "以下是该智能体最近的对话，仅用于保持上下文：\n" + "\n".join(history)
         )
+    # 放在人设和历史之后，避免历史开场白或人设示例被当成每轮输出模板。
+    parts.append(HARDWARE_REALTIME_OPENING_RULES)
     return "\n\n".join(parts)
 
 
