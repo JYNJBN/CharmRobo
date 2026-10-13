@@ -147,7 +147,8 @@ class DelayedAudioUpstream(FakeUpstream):
 
 class FakeDevice:
     def __init__(
-        self, route=None, turns=1, cancel=False, size=None, audio_format="pcm"
+        self, route=None, turns=1, cancel=False, size=None, audio_format="pcm",
+        device_sn="test-device",
     ):
         self.query_params = {}
         self.headers = {}
@@ -157,12 +158,13 @@ class FakeDevice:
         self.route, self.turns, self.cancel = route, turns, cancel
         self.size, self.audio_format = size, audio_format
         self.completed = 0
+        self.device_sn = device_sn
         self.start()
 
     def start(self):
         message = {
             "type": "dialogue.start",
-            "device_sn": "test-device",
+            "device_sn": self.device_sn,
             "audio_format": self.audio_format,
         }
         if self.route:
@@ -204,6 +206,7 @@ class FakeDevice:
 
 def business_session(agent_id=9):
     return SimpleNamespace(
+        device_sn="test-device",
         user_id=1,
         device_id=2,
         agent_id=agent_id,

@@ -16,7 +16,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -25,6 +25,9 @@ from websockets.exceptions import WebSocketException
 from app.core.config import settings
 from app.integrations.hardware_mp3_bridge import PcmToCiMp3Bridge
 from app.utils.tools import BEIJING_TIMEZONE, build_current_time_context, local_now
+
+if TYPE_CHECKING:
+    from app.services.hardware_actions import ActionResult
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +108,7 @@ class HardwareQwenResult:
     timings_ms: dict[str, int] = field(default_factory=dict)
     needs_repeat: bool = False
     upstream_reused: bool = False
+    action_result: ActionResult | None = None
 
 
 class HardwareQwenRealtimeSession:
@@ -115,6 +119,7 @@ class HardwareQwenRealtimeSession:
         trace_id: str,
         send_audio: Callable[[bytes], Awaitable[None]],
         retrieve_references: Callable[[str], Awaitable[str]],
+        resolve_action: Callable[[str], Awaitable[ActionResult | None]] | None = None,
         started_at: float | None = None,
         reuse_key: tuple[object, ...] | None = None,
     ) -> None:
@@ -132,6 +137,7 @@ class HardwareQwenRealtimeSession:
         self._voice = settings.hardware_qwen_realtime_voice
         self._send_audio = send_audio
         self._retrieve_references = retrieve_references
+        self._resolve_action = resolve_action
         self.result = HardwareQwenResult(started_at=started_at or time.perf_counter())
         self._commands: asyncio.Queue[tuple[str, bytes | None]] = asyncio.Queue(
             settings.hardware_qwen_queue_size
@@ -185,6 +191,7 @@ class HardwareQwenRealtimeSession:
             "commit_send_ms": ("commit_start", "commit_sent"),
             "asr_ms": ("commit_start", "asr_done"),
             "retrieval_ms": ("retrieval_start", "retrieval_done"),
+            "action_ms": ("action_start", "action_done"),
             "context_update_ms": ("context_update", "context_confirmed"),
             "response_to_first_text_ms": ("response_requested", "first_text"),
             "end_to_first_text_ms": ("capture_end", "first_text"),
@@ -564,6 +571,39 @@ class HardwareQwenRealtimeSession:
             raise HardwareQwenError("会话尚未启动")
         return await self._task
 
+    @staticmethod
+    def _announcement_instructions(text: str) -> str:
+        return (
+            "这是服务器根据设备接口实际返回结果生成的状态播报。"
+            "不要重新执行任何动作，不回答之前的问题，不使用人设、记忆、知识库或联网搜索。"
+            "只用当前音色逐字说出以下内容，不补充、不改写、不提前宣称制作完成：\n" + text
+        )
+
+    async def announce(self, text: str) -> HardwareQwenResult:
+        """本轮响应已发完后，同一上游续播机器状态，不再录音或下单。"""
+        if self._closed or self._ws is None or self._task is None or not self._task.done():
+            raise HardwareQwenError("状态播报前语音会话未就绪")
+        self._task.result()
+        self.result = HardwareQwenResult()
+        self._answer_parts.clear()
+        self._text_parts.clear()
+        self._marks = {"dialogue_start": self.result.started_at}
+        self._last_pcm_at = self._last_mp3_at = None
+        self._commands = asyncio.Queue(settings.hardware_qwen_queue_size)
+        self._mp3 = asyncio.Queue(settings.hardware_qwen_queue_size)
+        self._bridge_error = self._loop.create_future()
+        self._response_requested = False
+        self._active_search_enabled = False
+        self._context_update_event_id = "pending_announcement"
+        await self._start_bridge()
+        self._phase = "制作状态播报配置"
+        self._deadline = time.monotonic() + settings.hardware_qwen_connect_timeout_seconds
+        self._mark("context_update")
+        self._context_update_event_id = await self._send("session.update", session={
+            "instructions": self._announcement_instructions(text), "enable_search": False,
+        })
+        return await self.wait()
+
     def _trace(self, stage: str, fields: dict[str, object]) -> None:
         logger.debug("[HARDWARE-QWEN][%s] %s %s", self.trace_id, stage, fields)
 
@@ -711,20 +751,31 @@ class HardwareQwenRealtimeSession:
                         ASR_EMPTY_REPEAT_PROMPT,
                     )
                 else:
-                    self._mark("retrieval_start")
-                    self._phase = "本轮资料检索"
-                    references = await self._retrieve_references(self.result.asr_text)
-                    self._mark("retrieval_done")
-                    logger.info(
-                        "[HARDWARE-QWEN][%s][资料检索] 总耗时=%sms 参考字数=%d",
-                        self.trace_id,
-                        self._duration("retrieval_start", "retrieval_done"),
-                        len(references),
-                    )
-                    instructions = self._turn_instructions(references)
+                    action = None
+                    if self._resolve_action is not None:
+                        self._phase = "设备动作执行"
+                        self._mark("action_start")
+                        action = await self._resolve_action(self.result.asr_text)
+                        self._mark("action_done")
+                    self.result.action_result = action
+                    if action is not None:
+                        self._active_search_enabled = False
+                        instructions = self._announcement_instructions(action.answer_text)
+                    else:
+                        self._mark("retrieval_start")
+                        self._phase = "本轮资料检索"
+                        references = await self._retrieve_references(self.result.asr_text)
+                        self._mark("retrieval_done")
+                        logger.info(
+                            "[HARDWARE-QWEN][%s][资料检索] 总耗时=%sms 参考字数=%d",
+                            self.trace_id,
+                            self._duration("retrieval_start", "retrieval_done"),
+                            len(references),
+                        )
+                        instructions = self._turn_instructions(references)
                 self._mark("context_update")
                 updated_session: dict[str, Any] = {"instructions": instructions}
-                if self.result.needs_repeat:
+                if self.result.needs_repeat or self.result.action_result is not None:
                     updated_session["enable_search"] = False
                 self._context_update_event_id = await self._send(
                     "session.update", session=updated_session

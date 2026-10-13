@@ -31,7 +31,7 @@ from app.schemas.Model import ModelRegistryObject
 
 logger = logging.getLogger(__name__)
 
-ActionName = Literal["chat", "music", "music_not_found", "weather", "weather_error"]
+ActionName = Literal["chat", "music", "music_not_found", "weather", "weather_error", "icecream"]
 
 _MUSIC_TRIGGER_WORDS = (
     "播放",
@@ -255,6 +255,8 @@ class ActionResult:
     answer_text: str = ""
     track: MusicTrack | None = None
     action_payload: dict[str, object] | None = None
+    # 制作等长任务的状态播报；只在发起该任务的语音轮次内消费。
+    status_updates: asyncio.Queue[ActionResult] | None = None
 
 
 class LocalMusicLibrary:
