@@ -14,7 +14,6 @@ from app.core.errors import BizError
 from app.core.exception_handlers import biz_error_handler, http_exception_handler
 from app.core.redis import close_redis, redis_client
 from app.integrations.embedding import close_embedding_client
-from app.services.icecream_service import icecream_service
 
 
 def setup_logging(level: str) -> None:
@@ -104,7 +103,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await icecream_service.aclose()
         # FastAPI 停止时释放 Redis 连接池。
         await close_redis()
         logger.info("Redis 连接已关闭")

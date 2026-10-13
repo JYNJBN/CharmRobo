@@ -79,7 +79,6 @@ from app.services.hardware_tools import (
     build_hardware_tools,
     execute_hardware_tool,
 )
-from app.services.icecream_service import icecream_service, iter_icecream_status_updates
 from app.services.model_service import resolve_model
 from app.services.voice_service import resolve_baidu_tts_per
 from app.utils.tools import local_now
@@ -515,10 +514,8 @@ async def _run_hardware_turn(
     # 显式短路，否则整条 resolve() 会照跑一遍 —— 白花时间，还会被关键词层
     # 半路截胡，模型根本没机会自己判断。
     hardware_tools = build_hardware_tools()
-    action_result = await icecream_service.resolve(asr_text, session.device_sn, request_id)
-    if action_result is not None:
-        logger.info("[HARDWARE-VOICE][%s][动作] 指定 SN 冰淇淋动作已处理", request_id)
-    elif hardware_tools is not None:
+    if hardware_tools is not None:
+        action_result = None
         logger.info(
             "[HARDWARE-VOICE][%s][动作] 工具直连模式，跳过关键词与路由 工具数=%d",
             request_id,
@@ -617,12 +614,6 @@ async def _run_hardware_turn(
         else:
             await stream_tts_text(action_result.answer_text)
             answer_text = action_result.answer_text
-        async for update in iter_icecream_status_updates(action_result):
-            check_cancelled()
-            await send_json({"type": "dialogue.action", "req": request_id,
-                             **(update.action_payload or {})})
-            await stream_tts_text(update.answer_text)
-            answer_text += update.answer_text
         if not answer_text or audio_bytes == 0:
             raise HardwareVoiceError("动作没有返回有效音频")
         await _save_message(session, role="user", content=asr_text)
@@ -961,21 +952,6 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
             result = await adapter.wait()
             if cancel_event.is_set():
                 return
-            if result.action_result is not None:
-                worker_phase = "冰淇淋状态查询及播报"
-                async for update in iter_icecream_status_updates(result.action_result):
-                    if cancel_event.is_set():
-                        return
-                    await send_json({"type": "dialogue.action", "req": worker_req,
-                                     **(update.action_payload or {})})
-                    announcement = await adapter.announce(update.answer_text)
-                    result.answer_text += announcement.answer_text
-                    result.audio_bytes += announcement.audio_bytes
-                    result.audio_chunks += announcement.audio_chunks
-                    result.output_pcm_bytes += announcement.output_pcm_bytes
-                    result.output_pcm_chunks += announcement.output_pcm_chunks
-                    logger.info("[ICECREAM][%s][状态已播报] status=%s 字数=%d", worker_req,
-                                (update.action_payload or {}).get("status"), len(announcement.answer_text))
             if result.needs_repeat:
                 logger.info("[HARDWARE-QWEN][%s][未听清提示] 语音提示已发完，不保存问答、不生成摘要", worker_req)
             else:
@@ -1024,7 +1000,7 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                 "provider_audio_max_gap_ms": result.provider_audio_max_gap_ms,
                 "mp3_output_max_gap_ms": result.mp3_output_max_gap_ms,
                 "total_ms": int((perf_counter() - result.started_at) * 1000),
-                "action": result.action_result.action if result.action_result is not None else "chat",
+                "action": "chat",
             })
             logger.info("[HARDWARE-QWEN][%s][本轮汇总] 完成消息发送=%dms 总耗时=%dms timings_ms=%s", worker_req, int((perf_counter() - phase_started_at) * 1000), int((perf_counter() - result.started_at) * 1000), json.dumps(result.timings_ms, ensure_ascii=False))
         except asyncio.CancelledError:
@@ -1476,22 +1452,11 @@ async def hardware_dialogue_websocket(client: WebSocket) -> None:
                     ) -> str:
                         return await retrieve_hardware_realtime_references(context, query, trace)
 
-                    async def resolve_realtime_action(
-                        query: str, context: HardwareSession = business_session, trace: str = request_id,
-                        event: asyncio.Event = realtime_cancel,
-                    ):
-                        action = await icecream_service.resolve(query, context.device_sn, trace)
-                        if action is not None and not event.is_set():
-                            await send_json({"type": "dialogue.action", "req": trace,
-                                             **(action.action_payload or {})})
-                        return action
-
                     previous_realtime = realtime_session
                     realtime_session = HardwareQwenRealtimeSession(
                         instructions=build_hardware_realtime_instructions(business_session),
                         trace_id=request_id, send_audio=forward_realtime_audio,
                         retrieve_references=retrieve_realtime, started_at=turn_started_at,
-                        resolve_action=resolve_realtime_action,
                         reuse_key=(
                             business_session.user_id, business_session.device_id,
                             business_session.agent_id, business_session.agent_name,

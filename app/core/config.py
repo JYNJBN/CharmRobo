@@ -193,17 +193,6 @@ class Settings(BaseSettings):
     #   注意：流式与非流式在"没提城市"时行为不完全一致（流式倾向反问城市），
     #   所以工具描述里写明了"留空即用设备默认城市"。
     hardware_tool_calling_enable: bool = False
-    # 冰淇淋 HTTP 动作仅允许这个 SN；空 IP 时不会发送请求。
-    icecream_enabled: bool = False
-    icecream_device_sn: str = "VI-ESP32S3-68EE8FC60B38"
-    icecream_ip: str = ""
-    icecream_port: int = Field(default=8080, ge=1, le=65535)
-    icecream_username: str = "chuangmenglong"
-    icecream_password: SecretStr | None = None
-    icecream_query_timeout_seconds: float = Field(default=5, gt=0)
-    icecream_execute_timeout_seconds: float = Field(default=10, gt=0)
-    icecream_poll_interval_seconds: float = Field(default=1.5, ge=1, le=2)
-    icecream_monitor_timeout_seconds: float = Field(default=300, gt=0)
     # 上传文件保存目录（相对项目根目录），通过 /static 提供访问
     upload_dir: str = "uploads"
     # 火山 STT 读取临时音频文件时使用的公网基础地址，例如 ngrok HTTPS 地址。
